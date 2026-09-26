@@ -30,7 +30,7 @@ jobs:
           - { name: darwin-arm64,  goos: darwin,  goarch: arm64, server: false }
           - { name: windows-amd64, goos: windows, goarch: amd64, server: false }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装交叉 C 编译器
         if: matrix.apt != ''
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ${{ matrix.apt }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.23'
           cache: false
@@ -63,7 +63,11 @@ jobs:
           if [ '${{ matrix.goos }}' = 'linux' ]; then
             readelf -h server client | grep -E 'Class|Machine'
           else
-            file client* 2>/dev/null || true
+            # 注意用 file -b:不带文件名前缀的输出不会被 GitHub 误当注解
+            for f in client client.exe; do
+              [ -f "$f" ] && file -b "$f"
+            done
+            true
           fi
 
       - name: 打包
@@ -79,7 +83,7 @@ jobs:
           fi
           ls -lh out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.name }}
           path: out/*
@@ -89,7 +93,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -101,7 +105,7 @@ jobs:
           sha256sum tcp-conn-stress-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: ${{ github.event.inputs.version || github.ref_name }}
