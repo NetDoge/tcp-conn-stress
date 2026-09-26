@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,7 +44,11 @@ type clientConfig struct {
 type target struct {
 	ip   string
 	port int
-	addr string // net.JoinHostPort 结果,IPv6 自带方括号
+	addr  string // net.JoinHostPort 结果,IPv6 自带方括号
+	// 该 target 已确认服务器不要求鉴权(-pass 对它忽略):
+	// 状态记在 target 上而非全局 —— 混合列表(有的服务器带 -pass 有的不带)
+	// 时,无密码服务器不能把带密码服务器的握手也跳过(P0 修复)
+	noAuth atomic.Bool
 }
 
 type stats struct {
@@ -79,12 +84,13 @@ func parseTargets(s string) ([]target, error) {
 		if err != nil {
 			return nil, fmt.Errorf("bad target %q: %v", p, err)
 		}
-		var pn int
-		if _, err := fmt.Sscanf(port, "%d", &pn); err != nil || pn <= 0 || pn > 65535 {
+		// 回环校验拒绝尾部垃圾与前导零/正负号("8888x"/"0080"/"+80"),
+		// 与服务端 isValidPort 同等严格(旧版 fmt.Sscanf 不查尾部,静默拨错端口)
+		pn, err := strconv.Atoi(port)
+		if err != nil || pn <= 0 || pn > 65535 || strconv.Itoa(pn) != port {
 			return nil, fmt.Errorf("bad port in %q", p)
 		}
-		out = append(out, target{ip: host, port: pn,
-			addr: net.JoinHostPort(host, fmt.Sprintf("%d", pn))})
+		out = append(out, target{ip: host, port: pn, addr: net.JoinHostPort(host, port)})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no targets")
@@ -157,7 +163,7 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 	tlen := len(targets)
 	for off := 0; off < tlen; off++ {
 		idx := (startIdx + off) % tlen
-		t := targets[idx]
+		t := &targets[idx] // 指针:clientAuth 要把 noAuth 状态写回 target 本体
 		st.try.Add(1)
 		conn, err := d.DialContext(ctx, "tcp", t.addr)
 		if err != nil {
@@ -170,7 +176,7 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 			continue
 		}
 		if pass != "" {
-			if err := clientAuth(conn, pass); err != nil {
+			if err := clientAuth(conn, pass, t); err != nil {
 				_ = conn.Close()
 				st.failAuth.Add(1)
 				if n := authConsecFail.Add(1); n >= 10 {
@@ -181,7 +187,8 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 			authConsecFail.Store(0)
 		}
 		st.ok.Add(1)
-		st.active.Add(1)
+		// active 的计入由调用方(worker)预留完成:拨号+鉴权中的连接
+		// 也占 target 名额,防多 worker 竞态过冲(实测 max_alive=target+1)
 		return conn, (idx + 1) % tlen
 	}
 	// 全部失败:保持起点,下个 token 从同一位置再轮
@@ -209,7 +216,8 @@ func holdConn(ctx context.Context, conn net.Conn) {
 		// (配了密码的话 banner 在 clientAuth 握手里就被消费掉了)。
 		// 前缀匹配:banner 即使分段到达也能识别。
 		if n > 0 && n <= len(authBanner) && string(buf[:n]) == authBanner[:n] {
-			log.Fatalf("服务器要求鉴权而握手未完成(本端未配 -pass 或网络延迟过高),已中止")
+			log.Fatalf("服务器 %s 要求鉴权但握手未完成(本端未配 -pass / 两端配置不一致 / 网络延迟过高),已中止",
+				conn.RemoteAddr())
 		}
 		close(done)
 	}()
@@ -262,8 +270,8 @@ func runClient(cfg clientConfig) {
 		log.Printf("auth: enabled")
 	}
 	log.Printf("targets:")
-	for _, t := range targets {
-		log.Printf("  - %s", t.addr)
+	for i := range targets {
+		log.Printf("  - %s", targets[i].addr)
 	}
 	if cfg.bind != "" {
 		log.Printf("bind local ip: %s", cfg.bind)
@@ -271,8 +279,9 @@ func runClient(cfg clientConfig) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
-	// SIGHUP 一并优雅处理:ssh 断开时也能打完 final 统计再退
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	// SIGHUP(ssh 断开)与 SIGQUIT(Ctrl-\)一并优雅处理:
+	// 都能打完 final 统计再退(QUIT 默认行为是打栈退出 rc=2,统计全丢)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	go func() {
 		<-sigCh
 		log.Println("signal received, draining...")
@@ -326,7 +335,11 @@ func runClient(cfg clientConfig) {
 					if ctx.Err() != nil {
 						return
 					}
-					if st.active.Load() >= int64(target) {
+					// 预留槽位后拨号:active 语义 = 已建立 + 拨号中(含鉴权)。
+					// 旧版"先查后拨"在多 worker 竞态下会过冲(max_alive=target+1);
+					// 原子预留保证 active 恒 <= target。
+					if n := st.active.Add(1); n > int64(target) {
+						st.active.Add(-1)
 						// 已达目标,让出 CPU,等 ctx 结束
 						time.Sleep(100 * time.Millisecond)
 						continue
@@ -334,6 +347,7 @@ func runClient(cfg clientConfig) {
 					conn, next := dialOnce(ctx, targets, portIdx, d, cfg.pass)
 					portIdx = next
 					if conn == nil {
+						st.active.Add(-1) // 拨号/鉴权全失败,释放预留
 						continue
 					}
 					hold.Add(1)

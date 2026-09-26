@@ -24,7 +24,8 @@ import (
 )
 
 // runServer 进入 C 服务端主循环(等价旧版 ./server),阻塞至 SIGINT/SIGTERM。
-// pass 非空时经 argv 传给 C 侧("-pass <密码>",C 侧解析后启用鉴权)。
+// pass 非空时经 setter 注入 C 侧堆内存(不进 argv,
+// /proc/<pid>/cmdline 不落密码 —— ps aux 不可见)。
 func runServer(ports []string, pass string) error {
 	if len(ports) == 0 {
 		return fmt.Errorf("服务器模式需要至少一个端口: tcp-stress -s <port1> [port2] ...")
@@ -42,19 +43,23 @@ func runServer(ports []string, pass string) error {
 	}
 
 	// C 侧沿用旧版 argv 约定:argv[0]=程序名,端口从 argv[1] 起
-	argv := make([]*C.char, 0, len(ports)+3)
+	// (密码不走 argv,见 tcp_server_set_pass)
+	argv := make([]*C.char, 0, len(ports)+1)
 	argv = append(argv, C.CString("tcp-stress"))
-	if pass != "" {
-		argv = append(argv, C.CString("-pass"), C.CString(pass))
-	}
 	for _, p := range ports {
 		argv = append(argv, C.CString(p))
 	}
 	defer func() {
 		for _, a := range argv {
 			C.free(unsafe.Pointer(a))
-		}
+	}
 	}()
+
+	if pass != "" {
+		cPass := C.CString(pass)
+		defer C.free(unsafe.Pointer(cPass))
+		C.tcp_server_set_pass(cPass)
+	}
 
 	rc := C.tcp_server_main(C.int(len(argv)), (**C.char)(unsafe.Pointer(&argv[0])))
 	if rc != 0 {

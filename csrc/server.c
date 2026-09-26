@@ -86,14 +86,52 @@ static int g_auth_n = 0;
 static const char *g_pass = NULL;          /* NULL = 不鉴权 */
 static volatile uint64_t g_auth_fail = 0;  /* 鉴权失败累计 */
 static time_t g_last_authfail_log = 0;
+static time_t g_last_evict_log = 0;
+
+/* 密码经此 setter 注入(堆拷贝),不进 argv —— /proc/<pid>/cmdline 不落密码。
+ * argv 的 -pass 解析保留(独立编译 server.c 的旧用法),Go 侧不再走 argv。 */
+static char *g_pass_heap = NULL;
+__attribute__((unused)) static void tcp_server_set_pass(const char *p) {
+    if (!p) return;
+    char *dup = strdup(p);
+    if (!dup) {
+        /* fail-closed:要求鉴权却因内存不足静默关掉更糟 */
+        fprintf(stderr, "tcp_server_set_pass: out of memory\n");
+        exit(1);
+    }
+    free(g_pass_heap);
+    g_pass_heap = dup;
+    g_pass = dup;
+}
 
 static const char AUTH_BANNER_S[] = "AUTH?\n";
 static const char AUTH_OK_S[]     = "AUTH OK\n";
 static const char AUTH_ERR_S[]    = "AUTH ERR\n";
 
 /* 紧凑数组三件套:add / find / remove(swap 删,保持稠密) */
+static void auth_remove_at(int i);
+static void auth_fail_bump(void);
 static int auth_add(int fd, time_t deadline) {
-    if (g_auth_n >= AUTH_MAX) return -1;
+    if (g_auth_n >= AUTH_MAX) {
+        /* 队列满:驱逐 deadline 最早的停滞连接,把槽位让给新连接。
+         * 旧逻辑直接拒绝新连接 —— 攻击者用一批连上但不回密码的连接
+         * 即可占满队列,把携带正确密码的合法客户端整个拒之门外(DoS)。
+         * 驱逐后:合法客户端毫秒级完成握手,永远轮不到被驱逐;攻击者的
+         * 停滞连接自相轮换,合法流量始终进得来。 */
+        int oldest = 0;
+        for (int i = 1; i < g_auth_n; i++)
+            if (g_auth_q[i].deadline < g_auth_q[oldest].deadline) oldest = i;
+        int victim = g_auth_q[oldest].fd;
+        auth_remove_at(oldest);
+        close(victim); /* close 自动从 epoll 摘除 */
+        auth_fail_bump();
+        time_t now = time(NULL);
+        if (now - g_last_evict_log >= 10) {
+            g_last_evict_log = now;
+            fprintf(stderr, "auth: queue full (%d), evicted oldest pending\n",
+                    AUTH_MAX);
+        }
+    }
     g_auth_q[g_auth_n].fd = fd;
     g_auth_q[g_auth_n].deadline = deadline;
     g_auth_q[g_auth_n].len = 0;
@@ -249,6 +287,7 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP,  &sa, NULL);   /* ssh 断开也走优雅退出,保住 final 统计 */
+    sigaction(SIGQUIT, &sa, NULL);   /* Ctrl-\ 同样优雅退出,final 统计不丢 */
     signal(SIGPIPE, SIG_IGN);
 
     /* epoll */
@@ -345,9 +384,13 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
                                      sizeof(ae->buf) - (size_t)ae->len);
                     if (r > 0) {
                         ae->len += (int)r;
-                        if (memchr(ae->buf, '\n', (size_t)ae->len)) {
-                            /* 整行到齐:整缓冲须精确等于期望行 */
-                            if (ae->len == el &&
+                        char *nl = memchr(ae->buf, '\n', (size_t)ae->len);
+                        if (nl) {
+                            /* 第一行到齐:只比第一行,行后多余字节忽略
+                             * (与已建连忽略数据语义一致;旧版整缓冲比对
+                             * 会把 "AUTH pw\nGARBAGE" 判 ERR,与 Go 实现分叉) */
+                            size_t linelen = (size_t)(nl - ae->buf) + 1;
+                            if (linelen == (size_t)el &&
                                     memcmp(ae->buf, expect, (size_t)el) == 0 &&
                                     write(cfd, AUTH_OK_S, sizeof(AUTH_OK_S) - 1)
                                         == (ssize_t)(sizeof(AUTH_OK_S) - 1)) {

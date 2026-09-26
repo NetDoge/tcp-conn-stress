@@ -18,8 +18,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -73,27 +71,23 @@ func readAuthLine(c net.Conn) (string, error) {
 
 // ---------------- 客户端侧 ----------------
 
-// authNotRequired:首个连接确认服务器不要求鉴权后置位,后续连接跳过握手
-// (避免对无鉴权服务器每连接空等 5s banner 超时)
-var authNotRequired atomic.Bool
-
-var authIgnoreLogOnce sync.Once
-
 // clientAuth 建连后的握手;仅客户端配置了 -pass 时调用。
-// 服务器不要求鉴权 → 忽略 -pass 并置快速路径标志,返回 nil。
-func clientAuth(conn net.Conn, pass string) error {
-	if authNotRequired.Load() {
+// t.noAuth:该 target 已确认服务器不要求鉴权(无 -pass 服务端/旧版二进制),
+// 后续连接跳过探测,不再空等 5s banner 超时。
+// 状态记在 target 上而非全局(旧版全局标志在混合列表下互相污染:
+// 无密码服务器把状态置位后,带密码服务器的握手也被跳过,正确密码被误杀)。
+func clientAuth(conn net.Conn, pass string, t *target) error {
+	if t.noAuth.Load() {
 		return nil
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
 	line, err := readAuthLine(conn)
 	if err != nil || line != authBanner {
-		// 读超时/EOF/非 banner 内容:服务器不要求鉴权(或为旧版二进制)
-		authNotRequired.Store(true)
+		// 读超时/EOF/非 banner 内容:该服务器不要求鉴权(或为旧版二进制)
+		if t.noAuth.CompareAndSwap(false, true) {
+			log.Printf("server %s 未要求鉴权,-pass 已忽略", t.addr)
+		}
 		_ = conn.SetReadDeadline(time.Time{})
-		authIgnoreLogOnce.Do(func() {
-			log.Printf("server 未要求鉴权,-pass 已忽略")
-		})
 		return nil
 	}
 	if pass == "" {

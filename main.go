@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,7 @@ func main() {
 		serverMode  bool
 		clientMode  bool
 		pass        string
+		passFile    string
 		cfg         clientConfig
 	)
 	flag.BoolVar(&showVersion, "v", false, "打印版本号并退出")
@@ -56,7 +58,8 @@ func main() {
 	flag.BoolVar(&showHelp, "h", false, "打印帮助信息并退出")
 	flag.BoolVar(&showHelp, "help", false, "打印帮助信息并退出(同 -h)")
 	flag.BoolVar(&serverMode, "s", false, "服务器模式:位置参数为监听端口列表(全平台)")
-	flag.StringVar(&pass, "pass", "", "鉴权密码:服务端启用后,客户端须提供相同密码(1-128 字节,无空白)")
+	flag.StringVar(&pass, "pass", "", "鉴权密码:服务端启用后,客户端须提供相同密码(1-128 字节,无空白)。注意:密码会出现在 ps/进程列表里,敏感场景用 -passfile")
+	flag.StringVar(&passFile, "passfile", "", "从文件读鉴权密码(取首行;文件建议 chmod 600)。不落进程命令行,ps 不可见")
 	flag.BoolVar(&clientMode, "c", false, "客户端模式")
 	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表,逗号分隔,格式 IP:Port")
 	flag.StringVar(&cfg.bind, "bind", "", "客户端:本地出口 IP(多 WAN/策略路由时指定)")
@@ -75,6 +78,7 @@ func main() {
 示例:
   tcp-stress -s 8888 8889 8890
   tcp-stress -s -pass 秘密 8888 8890              # 带鉴权的服务端
+  tcp-stress -s -passfile /etc/tcp-stress.pass 8888   # 密码从文件读(不落 ps)
   tcp-stress -c -servers "192.168.1.100:8888,192.168.1.100:8889" -target 100000 -rate 200
   tcp-stress                                          # 终端里裸运行,进入交互向导
 
@@ -83,6 +87,30 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// -passfile:从文件读密码 —— 密码不进 argv,不落 /proc/<pid>/cmdline
+	// (-pass 的密码 ps aux 可见,敏感场景应改用本参数)
+	if passFile != "" {
+		if pass != "" {
+			fmt.Fprintln(os.Stderr, "error: -pass 与 -passfile 不能同时使用")
+			os.Exit(2)
+		}
+		b, err := os.ReadFile(passFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: 读 -passfile %s: %v\n", passFile, err)
+			os.Exit(2)
+		}
+		s := string(b)
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[:i] // 只取首行
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			fmt.Fprintf(os.Stderr, "error: -passfile %s 首行为空\n", passFile)
+			os.Exit(2)
+		}
+		pass = s
+	}
 
 	switch {
 	case showHelp:

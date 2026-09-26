@@ -4,6 +4,8 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
+# v1.0.7:审计修复(鉴权槽位驱逐/混合列表/端口校验/双实现对齐/SIGQUIT/-passfile/防过冲)
+#
 # 单一二进制 tcp-stress(-s 服务端 / -c 客户端),全平台全功能:
 #   - Linux(amd64/arm64): cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
 #   - 其他平台 + linux/armv7l: 纯 Go 服务端(server_go.go),行为与 C 版对齐
@@ -16,7 +18,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.6'
+        default: 'v1.0.7'
 
 permissions:
   contents: read
@@ -232,7 +234,7 @@ jobs:
           sleep 0.5
           ./tcp-stress -c -servers 127.0.0.1:18888 -target 5 -rate 5 \
             > ca3.log 2>&1 && { echo 'FAIL: 无密码应非零退出'; exit 1; } || true
-          grep -q '服务器要求鉴权' ca3.log || { echo 'FAIL: banner 未检出'; exit 1; }
+          grep -q '要求鉴权但握手未完成' ca3.log || { echo 'FAIL: banner 未检出'; exit 1; }
           kill -INT $SRV; sleep 0.5
           # A4 服务端无密码 + 客户端带密码:忽略并正常跑
           ./tcp-stress -s 18888 > sa4.log 2>&1 &
@@ -245,6 +247,108 @@ jobs:
           grep -q 'pass 已忽略' ca4.log || { echo 'FAIL: 未提示忽略'; exit 1; }
           grep -q 'final: try=20 ok=20' ca4.log || { echo 'FAIL: 忽略密码后未正常连接'; exit 1; }
           echo 'AUTH MATRIX PASS'
+
+      - name: 审计回归测试(v1.0.7 修复项)
+        run: |
+          # Python 侧要开 4200 个攻击 socket,先把 fd 软上限抬起来
+          # (runner 默认 soft 1024,不抬会先把自己饿死)
+          ulimit -S -n 65535 2>/dev/null || true
+
+          # 1) 鉴权槽位驱逐:4200 停滞连接占满队列,正确密码客户端仍须全部成功
+          ./tcp-stress -s -pass s3cret 18888 > ar1s.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          python3 - <<'PYEOF'
+          import socket, subprocess, time, re, signal
+          socks = []
+          for i in range(4200):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 18888), timeout=2)
+                  s.recv(64)
+                  socks.append(s)
+              except Exception:
+                  break
+          assert len(socks) >= 4100, f'stalled too few: {len(socks)}'
+          cli = subprocess.Popen(['./tcp-stress', '-c', '-servers', '127.0.0.1:18888',
+                                  '-pass', 's3cret', '-target', '10', '-rate', '10'],
+                                 stdout=open('ar1c.log', 'w'), stderr=subprocess.STDOUT)
+          time.sleep(6)
+          cli.send_signal(signal.SIGINT)
+          cli.wait(timeout=15)
+          out = open('ar1c.log', errors='replace').read()
+          assert re.search(r'final: try=10 ok=10', out), out[-400:]
+          for s in socks: s.close()
+          print('EVICTION PASS')
+          PYEOF
+          grep -q 'evicted oldest pending' ar1s.log || { echo 'FAIL: 无驱逐日志'; exit 1; }
+          kill -INT $SRV; sleep 0.5
+
+          # 2) 混合鉴权列表(无密码+有密码):正确密码须正常,不得误报中止
+          ./tcp-stress -s 18888 > ar2a.log 2>&1 & S1=$!
+          ./tcp-stress -s -pass s3cret 18889 > ar2b.log 2>&1 & S2=$!
+          sleep 0.5
+          ./tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889" -pass s3cret \
+            -target 10 -rate 10 > ar2c.log 2>&1 &
+          CLI=$!
+          sleep 12
+          kill -INT $CLI; sleep 2
+          grep -q 'final: try=10 ok=10' ar2c.log || { echo 'FAIL: 混合列表未跑满'; cat ar2c.log; exit 1; }
+          if grep -q '已中止' ar2c.log; then echo 'FAIL: 混合列表误报中止'; cat ar2c.log; exit 1; fi
+          kill -INT $S1 $S2; sleep 0.5
+
+          # 3) 端口解析:尾部垃圾/前导零一律拒绝
+          rc=0
+          ./tcp-stress -c -servers 127.0.0.1:8888x -rate 1 >/dev/null 2> ar3.log || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: 8888x rc=$rc"; exit 1; }
+          grep -q 'bad port in "127.0.0.1:8888x"' ar3.log || { echo 'FAIL: 8888x 文案'; exit 1; }
+          rc=0
+          ./tcp-stress -c -servers 127.0.0.1:0080 -rate 1 >/dev/null 2>&1 || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: 0080 rc=$rc"; exit 1; }
+
+          # 4) SIGQUIT:客户端优雅退出,final 统计不丢
+          ./tcp-stress -s 18888 > ar4s.log 2>&1 & SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -target 10 -rate 10 > ar4c.log 2>&1 & CLI=$!
+          sleep 3
+          kill -QUIT $CLI; sleep 2
+          grep -q 'final: try=10 ok=10' ar4c.log || { echo 'FAIL: SIGQUIT 丢 final'; exit 1; }
+          kill -INT $SRV; sleep 0.5
+
+          # 5) target 防过冲:max_alive 必须恰好等于 target
+          ./tcp-stress -s 18888 > ar5s.log 2>&1 & SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -target 3000 -rate 3000 -stats 500ms \
+            > ar5c.log 2>&1 & CLI=$!
+          sleep 8
+          kill -INT $CLI; sleep 2
+          max_alive=$(grep -oE 'alive=[0-9]+' ar5c.log | cut -d= -f2 | sort -n | tail -1)
+          # -le 而非精确相等:预留回滚(Add 后立即 Add(-1))存在纳秒级 3001 采样窗口,
+          # 持续过冲(旧 bug,稳定 3001+)才是要抓的;欠打由下一行 final 兜底
+          [ "$max_alive" -le 3000 ] || { echo "FAIL: max_alive=$max_alive > 3000(过冲)"; exit 1; }
+          grep -q 'final: try=3000 ok=3000' ar5c.log || { echo 'FAIL: 未达 target'; cat ar5c.log; exit 1; }
+          kill -INT $SRV; sleep 0.5
+
+          # 6) 双实现数据语义一致:连接上发数据须保持(alive=1),关闭才计 close
+          python3 - <<'PYEOF'
+          import socket, subprocess, time, re, signal
+          for binname in ['./tcp-stress', './tcp-stress-go']:
+              srv = subprocess.Popen([binname, '-s', '18888'],
+                                     stdout=open('ar6s.log', 'w'), stderr=subprocess.STDOUT)
+              time.sleep(0.7)
+              c = socket.create_connection(('127.0.0.1', 18888), timeout=2)
+              c.sendall(b'garbage-data\n')
+              time.sleep(2.5)
+              out = open('ar6s.log', errors='replace').read()
+              assert re.search(r'alive=1 \|', out), (binname, out[-300:])
+              c.close()
+              time.sleep(1.5)
+              out = open('ar6s.log', errors='replace').read()
+              assert re.search(r'total_close=1\b', out), (binname, out[-300:])
+              srv.send_signal(signal.SIGINT)
+              srv.wait(timeout=10)
+          print('DATA-SEMANTICS PASS')
+          PYEOF
+          echo 'AUDIT REGRESSION PASS'
 
       - name: TUI 冒烟(向导可进可退,非终端不误入)
         run: |

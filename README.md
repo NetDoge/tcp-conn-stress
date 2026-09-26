@@ -31,6 +31,7 @@ tcp-stress -h                                # 帮助(-help 同义,exit 0)
 | `auth.go` | v1.0.6 鉴权协议(单行文本握手)与客户端/纯 Go 服务端实现 |
 | `tui.go` + `tui_tty_*.go` | v1.0.6 零参数交互向导;TTY 判定按平台走 ioctl(isatty) |
 | `sockopt_unix.go` / `sockopt_windows.go` | 平台相关的底层 socket 调优(按 build tag 二选一) |
+| `rlimit_unix.go` / `rlimit_windows.go` | fd 软上限自动抬升(按 build tag 二选一) |
 | `Makefile` | 构建脚本(静态 cgo 构建) |
 | `go.mod` | Go module 定义 |
 | `.github/workflows/release.yml` | 云编译 + 自动发 Release |
@@ -84,6 +85,10 @@ tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -pass 我的密码 -target 10
 - 服务端要鉴权而客户端没配 `-pass`:客户端立即报错退出;服务端无鉴权而客户端带了 `-pass`:忽略并提示(两端版本/配置不匹配不会被静默吞掉)
 - 双端都不配 `-pass`:协议完全不出现,行为与旧版逐字节一致
 
+**密码传递**:
+- `-pass 密码`:便捷,但密码会出现在进程命令行里(`ps aux` / `/proc/<pid>/cmdline` 可见),同机多用户环境注意
+- `-passfile 文件`:从文件首行读密码(建议 `chmod 600`),**不落进程命令行**,敏感场景用这个;与 `-pass` 互斥
+
 **注意**:明文单行协议,防的是公网误用/白嫖,不是密码学对抗;公网部署仍建议配合安全组限源(见「安全注意」)。
 
 ---
@@ -98,21 +103,21 @@ tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -pass 我的密码 -target 10
 sysctl -w fs.file-max=2097152
 echo 'fs.file-max = 2097152' >> /etc/sysctl.conf
 
-# 3) 内核 TCP 内存档 - 10w+ 连接需要抬高三档
+# 2) 内核 TCP 内存档 - 10w+ 连接需要抬高三档
 sysctl -w net.ipv4.tcp_mem='131072 262144 524288'
 sysctl -w net.ipv4.tcp_wmem='4096 8192 16384'
 sysctl -w net.ipv4.tcp_rmem='4096 8192 16384'
 
-# 4) 允许 TIME_WAIT 复用 + 扩大半连接 / 全连接队列
+# 3) 允许 TIME_WAIT 复用 + 扩大半连接 / 全连接队列
 sysctl -w net.ipv4.tcp_tw_reuse=1
 sysctl -w net.ipv4.tcp_max_syn_backlog=262144
 sysctl -w net.core.somaxconn=262144
 
-# 5) 本地端口范围 - 默认 32768-60999(~28k/端口);单目标 10w+ 必须扩,
+# 4) 本地端口范围 - 默认 32768-60999(~28k/端口);单目标 10w+ 必须扩,
 #    或者直接给 -servers 多配几个端口(每端口独立 ~28k,程序自动轮询)
 sysctl -w net.ipv4.ip_local_port_range='1024 65535'
 
-# 6) conntrack 表(路由器/网关或开了 NAT 的机器需要)
+# 5) conntrack 表(路由器/网关或开了 NAT 的机器需要)
 #    实测 10w 连接至少给 30w,留 3x 余量
 sysctl -w net.netfilter.nf_conntrack_max=524288
 # 注意:nf_conntrack_buckets 是只读 sysctl,运行时改不了,只能模块加载时设
@@ -226,7 +231,7 @@ tcp-stress -c -bind 192.168.10.5 \
 
 客户端每秒打印:
 ```
-[STAT] alive=14613 try=14613 ok=14613 closed=0 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 eof=0 other=0
+[STAT] alive=14613 try=14613 ok=14613 closed=0 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 fd-full=0 eof=0 auth=0 other=0
 ```
 
 **关注:**
@@ -253,6 +258,8 @@ tcp-stress -c -bind 192.168.10.5 \
 - 不设 `-pass` 时,服务端监听 **0.0.0.0 且无任何认证**,任何能路由到端口的客户端都能建立连接、占用 fd 槽位;**公网部署请一律加 `-pass`**
 - `-pass` 是明文单行协议(见「服务端鉴权」),能挡扫描器和误用,挡不住嗅探/中间人;**公网 VPS 部署仍建议叠加安全组 / 防火墙限源 IP**,只放行测试客户端的出口地址,用完即关
 - `-s` 模式的端口只用于压测,不要复用已有服务的端口段;测试期间这些端口等于对外开放
+- 密码传递:`-pass` 会落进程命令行(`ps aux` 可见),敏感/多用户场景用 `-passfile`(v1.0.7)
+- 开 `-pass` 的服务端仍有资源面:鉴权中连接队列上限 4096,满时驱逐最早超时的挂起连接保证合法客户端进得来;慢速滴流垃圾字节会消耗服务端 CPU(实测 1000 连接 × 50B/s ≈ 单核 28%),公网部署叠加限源才是正解
 - 退出服务端后确认端口已关(`ss -tlnp | grep <port>`),容器/服务化部署另加访问控制
 
 ---
@@ -271,8 +278,8 @@ tcp-stress -c -bind 192.168.10.5 \
 ### cgo 合并方式
 - `server.c` 全部符号 `static`,经 `#include "csrc/server.c"` 编入 cgo 生成的编译单元,不产生包级符号,无重复定义
 - `-D_GNU_SOURCE=1` 由 cgo CFLAGS 命令行注入,保证 `accept4` 等扩展在 include 任何头之前就可见
-- Go 侧 `runServer` 把端口列表拼成 argv 传给 `tcp_server_main(argc, argv)`,进入后**不再回到 Go 运行时**(C 主循环自带 SIGINT/SIGTERM 处理)
-- `server_stub.go`(`//go:build !linux || !cgo`)保证纯 Go 构建可编译、`-s` 报错清晰
+- Go 侧 `runServer` 把端口列表拼成 argv 传给 `tcp_server_main(argc, argv)`,进入后**不再回到 Go 运行时**(C 主循环自带 SIGINT/SIGTERM/SIGHUP/SIGQUIT 优雅退出处理)
+- 纯 Go 构建的服务端走 `server_go.go` 全功能实现(旧版 `server_stub.go` 已于 v1.0.5 移除)
 
 ### 客户端(`client.go`)
 - `net.Dialer.Control` 走 `syscall.RawConn.Control(fd)` → 在内核 fd 上 `SetsockoptInt` 压缓冲区
@@ -290,6 +297,17 @@ tcp-stress -c -bind 192.168.10.5 \
 - 容器内回环:单端口 18888,2 秒内 accept **9315/s**,峰值活跃 **14613**。
 - 验证 `epoll` + `accept4` 主循环 + keepalive + 统计线程均工作正常。
 - 容器 ulimit 524288、内核无 conntrack 限制。
+
+2026-09-27 v1.0.7 全量审计修复轮(P0×2 / P1×6 / P2×4):
+
+- **鉴权槽位 DoS 修复**:C 服务端鉴权队列满(4096)时改为驱逐最早超时的挂起连接 —— 旧版直接拒绝新连接,4200 个"连上不回密码"的停滞连接即可把正确密码的客户端整个拒之门外(实测 ok=0),修复后同场景 ok=10/10
+- **混合鉴权列表修复**:`-pass` 状态从全局单标志改为 per-target —— 旧版列表里混有"无密码+有密码"服务器时,无密码服务器毒化全局状态,正确密码也被误杀(误报"本端未配 -pass");修复后两种顺序均 final try=20 ok=20
+- 端口解析收紧:`strconv.Atoi` + 回环校验,`8888x`/`0080`/`+80` 一律拒绝(旧版 `fmt.Sscanf` 静默拨 `8888x`→8888)
+- 双实现语义对齐:鉴权行尾多余字节忽略(与 Go 版一致);纯 Go 服务端收到数据改为丢弃保持连接(与 C 版一致)
+- SIGQUIT(Ctrl-\)双端均优雅退出打 final 统计(旧版客户端打栈退出 rc=2 统计丢)
+- 新增 `-passfile`:密码从文件读,不落 `/proc/<pid>/cmdline`
+- target 防过冲:worker 拨号前原子预留槽位,`active` 恒 ≤ target(旧版竞态下 max_alive=target+1)
+- 文档:`.gitignore` 盖住全部产物变体;README 修正 server_stub 死引用/STATS 示例字段/文件清单/sysctl 编号;CI 新增审计回归步(槽位驱逐、混合列表、端口校验、SIGQUIT、过冲上限)
 
 2026-09-26 审计轮(修复后复验):
 

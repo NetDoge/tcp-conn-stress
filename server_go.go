@@ -58,10 +58,18 @@ func (s *goServer) tune(c *net.TCPConn) {
 }
 
 // hold 阻塞直到对端断开(FIN/RST)、keepalive 判死或本端显式关闭。
+// 收到数据一律丢弃继续等 —— 与 C 服务端语义对齐(旧版 Read 一次返回
+// 就计 close,收到任意数据即断连,与 C 版行为分叉)。
 // 主动关闭(优雅退出)不计数 —— 与 C 版关闭路径语义一致。
 func (s *goServer) hold(ctx context.Context, c net.Conn, idx int) {
-	buf := make([]byte, 64)
-	_, _ = c.Read(buf)
+	buf := make([]byte, 2048)
+	for {
+		_, err := c.Read(buf)
+		if err != nil {
+			break // EOF / RST / 本端关闭
+		}
+		// 数据丢弃,继续等断开
+	}
 	_ = c.Close()
 	s.conns.Delete(c)
 	if ctx.Err() != nil {
@@ -91,9 +99,9 @@ func runServer(ports []string, pass string) error {
 		pn = append(pn, v)
 	}
 
-	// 信号 → ctx:INT/TERM/HUP 均触发优雅退出(与 C 版/客户端对齐)
+	// 信号 → ctx:INT/TERM/HUP/QUIT 均触发优雅退出(与 C 版/客户端对齐)
 	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer stop()
 
 	s := &goServer{ports: pn, perPort: make([]atomic.Int64, len(pn))}
@@ -114,13 +122,19 @@ func runServer(ports []string, pass string) error {
 		wg.Add(1)
 		go func(idx int, ln net.Listener) {
 			defer wg.Done()
+			var lastErrLog time.Time
 			for {
 				c, err := ln.Accept()
 				if err != nil {
 					if ctx.Err() != nil {
 						return // 优雅退出,listener 已关
 					}
-					// 瞬时错误(如 fd 耗尽):退避重试,绝不退出 listener
+					// 瞬时错误(如 fd 耗尽):退避重试,绝不退出 listener;
+					// 10s 限频留日志,否则静默吞掉排障线索(对齐 C 版 EMFILE 日志)
+					if time.Since(lastErrLog) > 10*time.Second {
+						lastErrLog = time.Now()
+						fmt.Fprintf(os.Stderr, "accept: %v (retrying with backoff)\n", err)
+					}
 					time.Sleep(200 * time.Millisecond)
 					continue
 				}

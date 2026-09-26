@@ -1,5 +1,8 @@
-# 编译产物不入库
-tcp-stress
+# 编译产物不入库(tcp-stress* 盖住 -go/-armv7l/.exe 等变体)
+tcp-stress*
 server
 client
 *.o
+# 测试残留(c.log/s.log 曾误提交)
+*.log
+*.pid
