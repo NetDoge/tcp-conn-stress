@@ -13,15 +13,25 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 )
 
+// 版本号:构建时注入(make VERSION=v1.0.3,CI 从 tag 取),默认 dev
+var version = "dev"
+
 func main() {
 	var (
-		serverMode bool
-		clientMode bool
-		cfg        clientConfig
+		showVersion bool
+		showHelp    bool
+		serverMode  bool
+		clientMode  bool
+		cfg         clientConfig
 	)
+	flag.BoolVar(&showVersion, "v", false, "打印版本号并退出")
+	flag.BoolVar(&showVersion, "version", false, "打印版本号并退出(同 -v)")
+	flag.BoolVar(&showHelp, "h", false, "打印帮助信息并退出")
+	flag.BoolVar(&showHelp, "help", false, "打印帮助信息并退出(同 -h)")
 	flag.BoolVar(&serverMode, "s", false, "服务器模式:位置参数为监听端口列表")
 	flag.BoolVar(&clientMode, "c", false, "客户端模式")
 	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表,逗号分隔,格式 IP:Port")
@@ -31,7 +41,8 @@ func main() {
 	flag.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "客户端:TCP KeepAlive 间隔")
 	flag.DurationVar(&cfg.statsInt, "stats", 1*time.Second, "客户端:统计打印周期")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `tcp-stress — 家用宽带极限 TCP 长连接压测(单二进制)
+		w := flag.CommandLine.Output()
+		fmt.Fprintf(w, `tcp-stress — 家用宽带极限 TCP 长连接压测(单二进制)
 
 用法:
   tcp-stress -s <port1> [port2] ...          服务器模式(仅 Linux 构建)
@@ -48,6 +59,14 @@ func main() {
 	flag.Parse()
 
 	switch {
+	case showHelp:
+		// 显式求助走 stdout + exit 0;解析错误/裸调用仍走 stderr + exit 2
+		flag.CommandLine.SetOutput(os.Stdout)
+		flag.Usage()
+		os.Exit(0)
+	case showVersion:
+		fmt.Printf("tcp-stress %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		os.Exit(0)
 	case serverMode && clientMode:
 		fmt.Fprintln(os.Stderr, "error: -s 与 -c 不能同时使用")
 		os.Exit(2)

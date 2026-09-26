@@ -8,6 +8,8 @@
 ```bash
 tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端)
 tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -target 100000 -rate 200
+tcp-stress -v                                # 版本号(-version 同义)
+tcp-stress -h                                # 帮助(-help 同义,exit 0)
 ```
 
 ---
@@ -242,6 +244,12 @@ tcp-stress -c -bind 192.168.10.5 \
 - 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
 - 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
 - CI 含同款长测,每次发版自动跑
+
+2026-09-26 v1.0.3 版本/帮助参数:
+
+- `-v` / `--version`:打印 `tcp-stress <版本> (平台/架构)` 并退出;版本号由构建注入(`make VERSION=v1.0.3`,CI 从 tag 取),CI 已断言
+- `-h` / `--help`:简要帮助走 stdout + exit 0;裸调用 / 参数错误仍走 stderr + exit 2
+- `-v`、`-h` 优先于 `-s`/`-c` 模式参数
 
 2026-09-26 v1.0.2 审计修复轮:
 

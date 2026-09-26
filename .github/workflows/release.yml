@@ -1,7 +1,7 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.2
+#   1) 推 tag 触发:  git push origin v1.0.3
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
 # v1.0.1 起单一二进制 tcp-stress(-s 服务端 / -c 客户端):
@@ -15,7 +15,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.2'
+        default: 'v1.0.3'
 
 permissions:
   contents: read
@@ -50,15 +50,18 @@ jobs:
         run: |
           ext=''
           if [ '${{ matrix.goos }}' = 'windows' ]; then ext='.exe'; fi
+          # 版本号:tag 触发取 tag 名,手动触发取输入
+          V='${{ github.event.inputs.version || github.ref_name }}'
+          echo "building version: ${V}"
           if [ '${{ matrix.goos }}' = 'linux' ]; then
             # cgo 静态构建:C 服务端经 server_linux.go 编入,交叉时 CC 指向交叉工具链
             CGO_ENABLED=1 CC='${{ matrix.cc || 'gcc' }}' GOARCH='${{ matrix.goarch }}' \
               go build -trimpath -tags 'osusergo netgo' \
-              -ldflags '-s -w -extldflags -static' -o "tcp-stress${ext}" .
+              -ldflags "-s -w -extldflags -static -X main.version=${V}" -o "tcp-stress${ext}" .
           else
             # darwin/windows:epoll 不可用,服务端替换为 stub(server_stub.go),纯 Go
             CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
-              go build -trimpath -ldflags '-s -w' -o "tcp-stress${ext}" .
+              go build -trimpath -ldflags "-s -w -X main.version=${V}" -o "tcp-stress${ext}" .
           fi
 
       - name: 校验产物
@@ -66,6 +69,7 @@ jobs:
           ls -lh
           if [ '${{ matrix.goos }}' = 'linux' ]; then
             readelf -h tcp-stress | grep -E 'Class|Machine'
+            if [ '${{ matrix.goarch }}' = 'amd64' ]; then ./tcp-stress -v; fi
           else
             # file -b:输出不带文件名前缀,不会被 GitHub 误当注解
             for f in tcp-stress tcp-stress.exe; do
@@ -102,7 +106,7 @@ jobs:
           cache: false
 
       - name: 编译(与发布同款静态 cgo 构建)
-        run: make
+        run: make VERSION=ci-smoke
 
       - name: 参数校验
         run: |
@@ -112,6 +116,11 @@ jobs:
           ./tcp-stress -s 2>&1 | grep -q '至少一个端口'
           ./tcp-stress 8888 -c 2>&1 | grep -q '未指定模式'
           ./tcp-stress -c -servers 127.0.0.1:1 -target 9223372036854775808 2>&1 | grep -q 'target too large'
+          ./tcp-stress -v    | grep -q '^tcp-stress ci-smoke (linux/amd64)'
+          ./tcp-stress --version | grep -q 'ci-smoke'
+          ./tcp-stress -h    | grep -q '家用宽带'
+          ./tcp-stress -h; [ $? -eq 0 ] || { echo 'FAIL: -h 应 exit 0'; exit 1; }
+          ./tcp-stress --help | grep -q '客户端模式'
 
       # 135s:故意跨过旧版 120s 读超时 bug 的阈值。
       # 旧版会在此时限内把健康连接全杀一轮(try 远超 target),

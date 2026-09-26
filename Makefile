@@ -8,13 +8,15 @@
 # 那边交叉编译用:
 #   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress .
 
-BINARY = tcp-stress
+BINARY  = tcp-stress
+# 版本号:构建时注入 -X main.version;CI 从 tag 取
+VERSION ?= dev
 
 .PHONY: all dyn clean
 
 all:
 	CGO_ENABLED=1 go build -trimpath -tags 'osusergo netgo' \
-	  -ldflags '-s -w -extldflags -static' -o $(BINARY) .
+	  -ldflags "-s -w -extldflags -static -X main.version=$(VERSION)" -o $(BINARY) .
 
 dyn:
 	CGO_ENABLED=1 go build -o $(BINARY) .

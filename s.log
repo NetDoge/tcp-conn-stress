@@ -1,0 +1,17 @@
+listening on 0.0.0.0:33501 (fd=4)
+listening on 0.0.0.0:33502 (fd=5)
+server running, ctrl-c to stop.
+[STATS t=1790423053s] alive=69 | total_acc=69 total_close=0 | +69/s -0/s
+         ports: 33501=35 33502=34
+[STATS t=1790423054s] alive=169 | total_acc=169 total_close=0 | +100/s -0/s
+         ports: 33501=84 33502=85
+[STATS t=1790423055s] alive=200 | total_acc=200 total_close=0 | +31/s -0/s
+         ports: 33501=100 33502=100
+[STATS t=1790423056s] alive=200 | total_acc=200 total_close=0 | +0/s -0/s
+         ports: 33501=100 33502=100
+[STATS t=1790423057s] alive=200 | total_acc=200 total_close=0 | +0/s -0/s
+         ports: 33501=100 33502=100
+[STATS t=1790423058s] alive=0 | total_acc=200 total_close=200 | +0/s -200/s
+         ports: 33501=0 33502=0
+shutting down...
+bye. final alive=0
