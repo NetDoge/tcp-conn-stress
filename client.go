@@ -287,9 +287,9 @@ func main() {
 				dt := curTry - lastTry
 				do := curOk - lastOk
 				lastTry, lastOk = curTry, curOk
-				log.Printf("[STAT] try=%d ok=%d active=%d | +try/s=%d +ok/s=%d | "+
+				log.Printf("[STAT] alive=%d try=%d ok=%d | +try/s=%d +ok/s=%d | "+
 					"fail t/o=%d rst=%d addr-full=%d eof=%d other=%d",
-					curTry, curOk, st.active.Load(), dt, do,
+					st.active.Load(), curTry, curOk, dt, do,
 					st.failTO.Load(), st.failRST.Load(), st.failAddr.Load(),
 					st.failEOF.Load(), st.failOther.Load())
 			}

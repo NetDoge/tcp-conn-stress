@@ -158,7 +158,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 客户端每秒打印:
 ```
-[STAT] try=14613 ok=14613 active=14612 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 eof=0 other=0
+[STAT] alive=14613 try=14613 ok=14613 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 eof=0 other=0
 ```
 
 **关注:**
