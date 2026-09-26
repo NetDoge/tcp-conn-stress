@@ -1,0 +1,4 @@
+# 编译产物不入库
+server
+client
+*.o
