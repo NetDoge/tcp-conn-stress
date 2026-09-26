@@ -2,12 +2,17 @@
 
 测试家用宽带 / 路由器 / NAT 设备在不交换业务数据的前提下,能维持多少个并发 TCP 长连接。
 **单二进制 `tcp-stress`,全平台全功能**:
-- `-s` 服务器模式:Linux 用 C + epoll(cgo 内嵌,极致内存);macOS / Windows 用纯 Go 等效实现(行为对齐)
+- `-s` 服务器模式:Linux 用 C + epoll(cgo 内嵌,极致内存);macOS / Windows / armv7l 用纯 Go 等效实现(行为对齐)
 - `-c` 客户端模式:纯 Go,token-bucket 限速,自动多端口轮询
+- `-pass`:服务端鉴权(v1.0.6)——设了密码的 服务端,客户端必须提供相同密码才计入统计
+- 裸运行进 TUI 向导(v1.0.6)——终端里不带参数运行,问答式配好全部参数,零学习成本
 
 ```bash
+tcp-stress                                    # 终端里裸运行,进入交互向导
 tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端)
+tcp-stress -s -pass 秘密 8888 8890            # 带鉴权的服务端
 tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -target 100000 -rate 200
+tcp-stress -c -servers "1.2.3.4:8888" -pass 秘密 -target 10000    # 客户端带密码
 tcp-stress -v                                # 版本号(-version 同义)
 tcp-stress -h                                # 帮助(-help 同义,exit 0)
 ```
@@ -23,6 +28,8 @@ tcp-stress -h                                # 帮助(-help 同义,exit 0)
 | `server_linux.go` | cgo 桥:Linux 构建把 C 服务端编进二进制 |
 | `server_go.go` | 纯 Go 服务端实现(darwin / windows,行为与 C 版对齐) |
 | `client.go` | Go 客户端主逻辑,轮询打满多端口 |
+| `auth.go` | v1.0.6 鉴权协议(单行文本握手)与客户端/纯 Go 服务端实现 |
+| `tui.go` + `tui_tty_*.go` | v1.0.6 零参数交互向导;TTY 判定按平台走 ioctl(isatty) |
 | `sockopt_unix.go` / `sockopt_windows.go` | 平台相关的底层 socket 调优(按 build tag 二选一) |
 | `Makefile` | 构建脚本(静态 cgo 构建) |
 | `go.mod` | Go module 定义 |
@@ -55,6 +62,29 @@ ulimit -H -n 1048576                      # 会话级(需 root)
 # systemd 服务:  [Service] LimitNOFILE=1048576
 # /etc/security/limits.conf:  * hard nofile 1048576
 ```
+
+---
+
+## 一a、服务端鉴权(-pass,v1.0.6)
+
+公网 VPS 上裸跑服务端,任何扫到端口的人都能连上来占 fd 槽位。`-pass` 给服务端加一道密码:
+
+```bash
+# 服务端:设密码(1-128 字节,不能含空白)
+tcp-stress -s -pass 我的密码 8888 8889
+
+# 客户端:提供相同密码
+tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -pass 我的密码 -target 10000
+```
+
+**协议与语义**:
+- 连接建立后服务端先发 `AUTH?\n`,客户端回 `AUTH <密码>\n`,服务端回 `AUTH OK\n` 或 `AUTH ERR\n`
+- 鉴权通过才计入 `alive`/`total_acc`;失败/超时(10s)的连接直接关闭,只计 `auth_fail`(STATS 行可见)
+- 密码错误连续 10 次:客户端主动中止(密码配错当场暴露,不空转刷连接)
+- 服务端要鉴权而客户端没配 `-pass`:客户端立即报错退出;服务端无鉴权而客户端带了 `-pass`:忽略并提示(两端版本/配置不匹配不会被静默吞掉)
+- 双端都不配 `-pass`:协议完全不出现,行为与旧版逐字节一致
+
+**注意**:明文单行协议,防的是公网误用/白嫖,不是密码学对抗;公网部署仍建议配合安全组限源(见「安全注意」)。
 
 ---
 
@@ -121,6 +151,7 @@ CGO_ENABLED=1 go build -trimpath -tags 'osusergo netgo' \
 ```bash
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o tcp-stress.exe .
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress     .
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm   GOARM=7 go build -trimpath -ldflags '-s -w' -o tcp-stress-armv7l .
 ```
 
 epoll 是 Linux 独有,这些构建的服务端走 `server_go.go`(纯 Go):
@@ -136,6 +167,7 @@ STATS 格式 / 断连回收 / 优雅退出 / KeepAlive 参数与 C 版对齐,
 | --- | --- | --- |
 | `tcp-conn-stress-linux-amd64.tar.gz` | `tcp-stress`(全功能) | x86_64 Linux |
 | `tcp-conn-stress-linux-arm64.tar.gz` | `tcp-stress`(全功能) | ARM64 Linux(树莓派等) |
+| `tcp-conn-stress-linux-armv7l.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | armv7l 32 位 ARM(老树莓派 / 路由器 / OpenWrt) |
 | `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Intel Mac |
 | `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Apple Silicon Mac |
 | `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | Windows |
@@ -218,8 +250,8 @@ tcp-stress -c -bind 192.168.10.5 \
 
 ## 四、安全注意(部署前必读)
 
-- 服务端监听 **0.0.0.0 且无任何认证**,任何能路由到端口的客户端都能建立连接、占用 fd 槽位
-- **公网 VPS 部署必须用安全组 / 防火墙限源 IP**,只放行测试客户端的出口地址,用完即关
+- 不设 `-pass` 时,服务端监听 **0.0.0.0 且无任何认证**,任何能路由到端口的客户端都能建立连接、占用 fd 槽位;**公网部署请一律加 `-pass`**
+- `-pass` 是明文单行协议(见「服务端鉴权」),能挡扫描器和误用,挡不住嗅探/中间人;**公网 VPS 部署仍建议叠加安全组 / 防火墙限源 IP**,只放行测试客户端的出口地址,用完即关
 - `-s` 模式的端口只用于压测,不要复用已有服务的端口段;测试期间这些端口等于对外开放
 - 退出服务端后确认端口已关(`ss -tlnp | grep <port>`),容器/服务化部署另加访问控制
 
@@ -266,6 +298,14 @@ tcp-stress -c -bind 192.168.10.5 \
 - 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
 - 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
 - CI 含同款长测,每次发版自动跑
+
+2026-09-26 v1.0.6 鉴权 + TUI + armv7l:
+
+- `-pass` 服务端鉴权:单行文本协议(`AUTH?` / `AUTH <密码>` / `AUTH OK|ERR`),C/epoll 与纯 Go 双实现语义一致;鉴权通过才计数,失败/超时(10s)计 `auth_fail`;客户端密码错 10 连败中止、配置不匹配当场报错不静默
+- C/epoll 侧鉴权走 EPOLLIN 状态机:行累积到 `\n` 才判定(密码行 TCP 分段到达不误杀,实测逐字节发送通过),鉴权中队列 AUTH_MAX=4096 + 超时扫描防 fd 耗尽
+- 零参数 TUI 向导:真终端裸运行进入,问答式配置(端口/地址/密码等,回车取默认),展示等价命令行再运行;管道/CI/重定向仍 usage exit 2(isatty ioctl 判定,挡住 /dev/null 这类字符设备)
+- 新增 linux-armv7l 产物(GOARM=7 纯 Go,老树莓派/OpenWrt 可用);CI smoke 增加鉴权矩阵与 TUI 冒烟
+- 已知边界:freebsd 构建有 rlimit 类型历史问题(无发布产物,不影响)
 
 2026-09-26 v1.0.5 全平台全功能:
 

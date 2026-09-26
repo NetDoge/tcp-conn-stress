@@ -6,7 +6,8 @@
 #
 # 非 Linux 平台(或未开 cgo)的服务端走 server_go.go 纯 Go 实现,同样全功能,
 # 交叉编译用:
-#   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress .
+#   CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress .
+#   CGO_ENABLED=0 GOOS=linux   GOARCH=arm   GOARM=7 go build -trimpath -ldflags '-s -w' -o tcp-stress-armv7l .
 
 BINARY  = tcp-stress
 # 版本号:构建时注入 -X main.version;CI 从 tag 取

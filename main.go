@@ -1,11 +1,12 @@
 // main.go - tcp-conn-stress 单二进制入口
 //
-// v1.0.1 起 server(C/epoll)与 client(Go)合并为一个二进制 tcp-stress:
-//   tcp-stress -s <port1> [port2] ...              服务器模式(cgo 调用 C 实现,仅 Linux)
-//   tcp-stress -c [-servers ...] [-target N] ...   客户端模式(纯 Go)
+// 单二进制 tcp-stress,三种用法:
+//   tcp-stress -s [-pass 密码] <port1> [port2] ...   服务器模式(Linux 走 C/epoll,其余纯 Go)
+//   tcp-stress -c [-servers ...] [-target N] ...     客户端模式(纯 Go)
+//   tcp-stress                                          终端里裸运行 → 交互式向导(TUI)
 //
-// - 非 Linux 平台的构建不含 C 服务端,-s 会明确报错(见 server_stub.go)
-// - 两种模式互斥;不带模式参数打印用法并退出
+// - 两种模式互斥;非终端环境(管道/CI)裸运行仍打印用法 exit 2
+// - -pass:服务端鉴权密码;双端一致才计入统计(详见 auth.go)
 
 package main
 
@@ -47,6 +48,7 @@ func main() {
 		showHelp    bool
 		serverMode  bool
 		clientMode  bool
+		pass        string
 		cfg         clientConfig
 	)
 	flag.BoolVar(&showVersion, "v", false, "打印版本号并退出")
@@ -54,6 +56,7 @@ func main() {
 	flag.BoolVar(&showHelp, "h", false, "打印帮助信息并退出")
 	flag.BoolVar(&showHelp, "help", false, "打印帮助信息并退出(同 -h)")
 	flag.BoolVar(&serverMode, "s", false, "服务器模式:位置参数为监听端口列表(全平台)")
+	flag.StringVar(&pass, "pass", "", "鉴权密码:服务端启用后,客户端须提供相同密码(1-128 字节,无空白)")
 	flag.BoolVar(&clientMode, "c", false, "客户端模式")
 	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表,逗号分隔,格式 IP:Port")
 	flag.StringVar(&cfg.bind, "bind", "", "客户端:本地出口 IP(多 WAN/策略路由时指定)")
@@ -71,7 +74,9 @@ func main() {
 
 示例:
   tcp-stress -s 8888 8889 8890
+  tcp-stress -s -pass 秘密 8888 8890              # 带鉴权的服务端
   tcp-stress -c -servers "192.168.1.100:8888,192.168.1.100:8889" -target 100000 -rate 200
+  tcp-stress                                          # 终端里裸运行,进入交互向导
 
 参数:
 `)
@@ -91,18 +96,31 @@ func main() {
 	case serverMode && clientMode:
 		fmt.Fprintln(os.Stderr, "error: -s 与 -c 不能同时使用")
 		os.Exit(2)
-	case serverMode:
-		if err := runServer(flag.Args()); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-	case clientMode:
-		if flag.NArg() > 0 {
-			fmt.Fprintf(os.Stderr, "error: 客户端模式不支持位置参数: %v\n", flag.Args())
+	case serverMode, clientMode:
+		if err := validatePass(pass); err != nil {
+			fmt.Fprintf(os.Stderr, "error: -pass %v\n", err)
 			os.Exit(2)
 		}
-		runClient(cfg)
+		if serverMode {
+			if err := runServer(flag.Args(), pass); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+		} else {
+			if flag.NArg() > 0 {
+				fmt.Fprintf(os.Stderr, "error: 客户端模式不支持位置参数: %v\n", flag.Args())
+				os.Exit(2)
+			}
+			cfg.pass = pass
+			runClient(cfg)
+		}
 	default:
+		// 完全不带参数 + 真终端:进交互向导;
+		// 带了 flag 却没选模式仍是错误;管道/CI 裸调用仍 usage exit 2
+		if len(os.Args) == 1 && interactiveTTY() {
+			runTUI()
+			return
+		}
 		if flag.NArg() > 0 {
 			fmt.Fprintf(os.Stderr, "error: 未指定模式(-s/-c);模式参数必须写在最前面,收到的位置参数: %v\n", flag.Args())
 		}

@@ -37,6 +37,7 @@ type clientConfig struct {
 	rate      int
 	keepAlive time.Duration
 	statsInt  time.Duration
+	pass      string // 服务端鉴权密码;-pass 启用,空 = 不鉴权
 }
 
 type target struct {
@@ -50,6 +51,7 @@ type stats struct {
 	ok     atomic.Uint64
 	active atomic.Int64
 	// 失败分类
+	failAuth  atomic.Uint64 // 鉴权失败(密码不对/服务器要求而未提供)
 	failTO    atomic.Uint64 // i/o timeout
 	failRST   atomic.Uint64 // connection refused
 	failAddr  atomic.Uint64 // cannot assign requested address (端口耗尽)
@@ -61,6 +63,9 @@ type stats struct {
 }
 
 var st stats
+
+// authConsecFail 连续鉴权失败计数;任一成功清零
+var authConsecFail atomic.Uint64
 
 func parseTargets(s string) ([]target, error) {
 	parts := strings.Split(s, ",")
@@ -148,7 +153,7 @@ func isTimeoutErr(err error) bool {
 // portIdx: 失败切到下一个 target 时使用;成功则由调用方持有。
 // 失败时返回 err;成功时返回 conn 与下一个要试的 portIdx。
 // 返回值用于在多端口之间轮询。
-func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer) (net.Conn, int) {
+func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer, pass string) (net.Conn, int) {
 	tlen := len(targets)
 	for off := 0; off < tlen; off++ {
 		idx := (startIdx + off) % tlen
@@ -163,6 +168,17 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 				time.Sleep(50 * time.Millisecond)
 			}
 			continue
+		}
+		if pass != "" {
+			if err := clientAuth(conn, pass); err != nil {
+				_ = conn.Close()
+				st.failAuth.Add(1)
+				if n := authConsecFail.Add(1); n >= 10 {
+					log.Fatalf("鉴权连续失败 %d 次(密码不正确或服务器要求鉴权),已中止;检查两端 -pass", n)
+				}
+				continue
+			}
+			authConsecFail.Store(0)
 		}
 		st.ok.Add(1)
 		st.active.Add(1)
@@ -188,7 +204,13 @@ func holdConn(ctx context.Context, conn net.Conn) {
 	buf := make([]byte, 64)
 	done := make(chan struct{})
 	go func() {
-		_, _ = conn.Read(buf)
+		n, _ := conn.Read(buf)
+		// 服务器鉴权 banner:只有客户端未配 -pass 时才会漏到这里
+		// (配了密码的话 banner 在 clientAuth 握手里就被消费掉了)。
+		// 前缀匹配:banner 即使分段到达也能识别。
+		if n > 0 && n <= len(authBanner) && string(buf[:n]) == authBanner[:n] {
+			log.Fatalf("服务器要求鉴权而握手未完成(本端未配 -pass 或网络延迟过高),已中止")
+		}
 		close(done)
 	}()
 	select {
@@ -232,6 +254,12 @@ func runClient(cfg clientConfig) {
 	targets, err := parseTargets(cfg.servers)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if err := validatePass(cfg.pass); err != nil {
+		log.Fatalf("-pass %v", err)
+	}
+	if cfg.pass != "" {
+		log.Printf("auth: enabled")
 	}
 	log.Printf("targets:")
 	for _, t := range targets {
@@ -303,7 +331,7 @@ func runClient(cfg clientConfig) {
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
-					conn, next := dialOnce(ctx, targets, portIdx, d)
+					conn, next := dialOnce(ctx, targets, portIdx, d, cfg.pass)
 					portIdx = next
 					if conn == nil {
 						continue
@@ -335,10 +363,10 @@ func runClient(cfg clientConfig) {
 				do := uint64(math.Round(float64(curOk-lastOk) / statsInt.Seconds()))
 				lastTry, lastOk = curTry, curOk
 				log.Printf("[STAT] alive=%d try=%d ok=%d closed=%d | +try/s=%d +ok/s=%d | "+
-					"fail t/o=%d rst=%d addr-full=%d fd-full=%d eof=%d other=%d",
+					"fail t/o=%d rst=%d addr-full=%d fd-full=%d eof=%d auth=%d other=%d",
 					st.active.Load(), curTry, curOk, st.closed.Load(), dt, do,
 					st.failTO.Load(), st.failRST.Load(), st.failAddr.Load(),
-					st.failFD.Load(), st.failEOF.Load(), st.failOther.Load())
+					st.failFD.Load(), st.failEOF.Load(), st.failAuth.Load(), st.failOther.Load())
 			}
 		}
 	}()

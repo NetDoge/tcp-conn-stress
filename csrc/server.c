@@ -11,6 +11,13 @@
  * 用法(已合并进 tcp-stress 单二进制,本文件由 cgo 前导 include):
  *   ./tcp-stress -s <port1> [port2] [port3] ...
  *   ./tcp-stress -s 8888 8889 8890
+ *   ./tcp-stress -s -pass <密码> 8888 8890    (v1.0.6 鉴权)
+ *
+ * 鉴权(v1.0.6,-pass 启用;协议见 auth.go,与纯 Go 服务端一致):
+ *   accept → 立即发 "AUTH?\n",连接进入"鉴权中",epoll 额外盯 EPOLLIN;
+ *   收到 "AUTH <密码>\n" 匹配 → 回 "AUTH OK\n",转已建连(开始计数),
+ *   只盯 RDHUP/ERR/HUP;不匹配/超时(10s)/断开 → 回 "AUTH ERR\n" 关闭,
+ *   计 auth_fail,不进任何连接统计。密码错误连接不占 alive/fd 长期。
  *
  * 退出:
  *   SIGINT / SIGTERM 触发优雅退出,关闭所有 fd。
@@ -66,6 +73,54 @@ static volatile uint64_t g_total_close   = 0; /* 累计关闭 */
 static volatile int g_stop = 0;
 /* EMFILE 告警限频(每 10s 最多一条) */
 static time_t g_last_emfile_log = 0;
+
+/* ---- v1.0.6 鉴权状态 ----
+ * g_pass == NULL:鉴权关闭,行为与旧版逐字节一致。
+ * 鉴权中的连接挤在紧凑数组里(上限 AUTH_MAX,超出直接关);
+ * 单线程事件循环内访问,无锁。 */
+#define AUTH_MAX     4096        /* 并发鉴权中连接上限(防恶意挂连接耗 fd) */
+#define AUTH_TIMEOUT 10          /* 鉴权超时秒数(与 Go 实现一致) */
+typedef struct { int fd; time_t deadline; char buf[160]; int len; } auth_ent;
+static auth_ent g_auth_q[AUTH_MAX];
+static int g_auth_n = 0;
+static const char *g_pass = NULL;          /* NULL = 不鉴权 */
+static volatile uint64_t g_auth_fail = 0;  /* 鉴权失败累计 */
+static time_t g_last_authfail_log = 0;
+
+static const char AUTH_BANNER_S[] = "AUTH?\n";
+static const char AUTH_OK_S[]     = "AUTH OK\n";
+static const char AUTH_ERR_S[]    = "AUTH ERR\n";
+
+/* 紧凑数组三件套:add / find / remove(swap 删,保持稠密) */
+static int auth_add(int fd, time_t deadline) {
+    if (g_auth_n >= AUTH_MAX) return -1;
+    g_auth_q[g_auth_n].fd = fd;
+    g_auth_q[g_auth_n].deadline = deadline;
+    g_auth_q[g_auth_n].len = 0;
+    g_auth_n++;
+    return 0;
+}
+static int auth_find(int fd) {
+    for (int i = 0; i < g_auth_n; i++)
+        if (g_auth_q[i].fd == fd) return i;
+    return -1;
+}
+static void auth_remove_at(int i) {
+    g_auth_q[i] = g_auth_q[--g_auth_n];
+}
+static void auth_remove(int fd) {
+    int i = auth_find(fd);
+    if (i >= 0) auth_remove_at(i);
+}
+static void auth_fail_bump(void) {
+    __sync_add_and_fetch(&g_auth_fail, 1);
+    time_t now = time(NULL);
+    if (now - g_last_authfail_log >= 10) {
+        g_last_authfail_log = now;
+        fprintf(stderr, "auth: rejected (total_fail=%lu)\n",
+                (unsigned long)g_auth_fail);
+    }
+}
 
 static void on_signal(int s) {
     (void)s;
@@ -143,10 +198,11 @@ static void *stats_thread(void *arg) {
 
         /* 用 stderr 避免与 epoll 线程 stdout 抢 */
         fprintf(stderr, "[STATS t=%lus] alive=%lu | total_acc=%lu total_close=%lu "
-                        "| +%lu/s -%lu/s\n",
+                        "| +%lu/s -%lu/s | auth_fail=%lu\n",
                 (unsigned long)time(NULL), (unsigned long)alive,
                 (unsigned long)now_acc, (unsigned long)now_close,
-                (unsigned long)acc_rate, (unsigned long)close_rate);
+                (unsigned long)acc_rate, (unsigned long)close_rate,
+                (unsigned long)g_auth_fail);
         fprintf(stderr, "         ports:");
         for (int i = 0; i < g_port_count; i++) {
             fprintf(stderr, " %u=%u", g_ports[i], g_per_port[i]);
@@ -162,17 +218,23 @@ static void *stats_thread(void *arg) {
  * static: cgo 会把本前导复制进多个生成的 C 文件,static 保证各编译单元私有,
  *         不会在链接期撞重复符号;unused 压掉未调用 TU 的告警。 */
 __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s -s <port1> [port2] ...\n", argv[0]);
+    int argi = 1;
+    /* v1.0.6:可选 "-pass <密码>" 前缀(Go 侧已校验格式,这里只取值) */
+    if (argc >= 3 && strcmp(argv[1], "-pass") == 0) {
+        g_pass = argv[2];
+        argi = 3;
+    }
+    if (argc < argi + 1) {
+        fprintf(stderr, "Usage: %s -s [-pass <密码>] <port1> [port2] ...\n", argv[0]);
         return 1;
     }
-    if (argc - 1 > MAX_LISTENERS) {
+    if (argc - argi > MAX_LISTENERS) {
         fprintf(stderr, "too many ports, limit=%d\n", MAX_LISTENERS);
         return 1;
     }
 
     /* 解析端口 */
-    for (int i = 1; i < argc; i++) {
+    for (int i = argi; i < argc; i++) {
         long p = strtol(argv[i], NULL, 10);
         if (p <= 0 || p > 65535) {
             fprintf(stderr, "invalid port: %s\n", argv[i]);
@@ -223,10 +285,24 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     /* EMFILE 时按端口记录 listener 摘除截止时间 */
     time_t pause_until[MAX_LISTENERS];
     memset(pause_until, 0, sizeof(pause_until));
+    if (g_pass) {
+        fprintf(stderr, "auth: enabled (password set)\n");
+    }
     fprintf(stderr, "server running, ctrl-c to stop.\n");
     while (!g_stop) {
         /* 摘除的 listener 到时挂回 */
         time_t now = time(NULL);
+
+        /* 鉴权超时扫描:挂着不发的连接 10s 后关闭(防 fd 耗尽) */
+        for (int k = 0; k < g_auth_n; ) {
+            if (now >= g_auth_q[k].deadline) {
+                close(g_auth_q[k].fd); /* close 自动从 epoll 摘除 */
+                auth_fail_bump();
+                auth_remove_at(k);
+            } else {
+                k++;
+            }
+        }
         for (int j = 0; j < g_port_count; j++) {
             if (pause_until[j] && now >= pause_until[j]) {
                 memset(&ev, 0, sizeof(ev));
@@ -251,7 +327,92 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
                 /* 已建连 socket:对端 FIN/RST 或 keepalive 判死 → 回收 */
                 int cfd = (int)(uint32_t)(dat & 0xffffffff);
                 uint32_t pidx = (uint32_t)((dat >> 32) & 0x7fffffff);
+                int pending = (g_pass && auth_find(cfd) >= 0); /* 鉴权中? */
+
+                /* 鉴权中 + 有数据:逐次累积 "AUTH <密码>\n" 再比对。
+                 * 单次 read 不保证整行到齐(TCP 分段),必须攒到 \n 才判。 */
+                if (pending && (events[i].events & EPOLLIN)) {
+                    int ai = auth_find(cfd);
+                    auth_ent *ae = (ai >= 0) ? &g_auth_q[ai] : NULL;
+                    char expect[152];
+                    int el = snprintf(expect, sizeof(expect), "AUTH %s\n", g_pass);
+                    if (!ae) { /* 状态不一致:按鉴权失败处理 */
+                        close(cfd);
+                        auth_fail_bump();
+                        continue;
+                    }
+                    ssize_t r = read(cfd, ae->buf + ae->len,
+                                     sizeof(ae->buf) - (size_t)ae->len);
+                    if (r > 0) {
+                        ae->len += (int)r;
+                        if (memchr(ae->buf, '\n', (size_t)ae->len)) {
+                            /* 整行到齐:整缓冲须精确等于期望行 */
+                            if (ae->len == el &&
+                                    memcmp(ae->buf, expect, (size_t)el) == 0 &&
+                                    write(cfd, AUTH_OK_S, sizeof(AUTH_OK_S) - 1)
+                                        == (ssize_t)(sizeof(AUTH_OK_S) - 1)) {
+                                /* 转已建连:摘 EPOLLIN,开始计数 */
+                                auth_remove(cfd);
+                                pending = 0;
+                                memset(&ev, 0, sizeof(ev));
+                                ev.events = EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                                ev.data.u64 = dat;
+                                epoll_ctl(ep, EPOLL_CTL_MOD, cfd, &ev);
+                                __sync_add_and_fetch(&g_per_port[pidx], 1);
+                                __sync_add_and_fetch(&g_total_alive, 1);
+                                __sync_add_and_fetch(&g_total_acc, 1);
+                                if (!(events[i].events &
+                                        (EPOLLRDHUP | EPOLLERR | EPOLLHUP))) {
+                                    continue; /* 健康,等下一个事件 */
+                                }
+                                /* 事件同时带断开标志:落入下方关闭路径(刚入账,计数对) */
+                            } else {
+                                (void)!write(cfd, AUTH_ERR_S, sizeof(AUTH_ERR_S) - 1);
+                                close(cfd);
+                                auth_remove(cfd);
+                                auth_fail_bump();
+                                continue;
+                            }
+                        } else if (ae->len >= (int)sizeof(ae->buf)) {
+                            /* 攒满仍无换行:超长,拒绝 */
+                            (void)!write(cfd, AUTH_ERR_S, sizeof(AUTH_ERR_S) - 1);
+                            close(cfd);
+                            auth_remove(cfd);
+                            auth_fail_bump();
+                            continue;
+                        }
+                        /* 行未到齐:保持鉴权中,等下一个 EPOLLIN */
+                    } else if (r == 0) {
+                        /* EOF:鉴权中途断开 */
+                        close(cfd);
+                        auth_remove(cfd);
+                        auth_fail_bump();
+                        continue;
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        close(cfd);
+                        auth_remove(cfd);
+                        auth_fail_bump();
+                        continue;
+                    }
+                    /* EAGAIN 或行未到齐:落入下方统一判定 */
+                }
+
+                /* 事件无断开/错误标志的两种"未终结"状态,都继续等:
+                 * - 鉴权中:密码行未到齐,等下一个 EPOLLIN
+                 *   (修复:旧逻辑此处落 close,分段到达的密码行在首字节
+                 *    后就被误杀 —— B5 逐字节握手实测复现)
+                 * - 已建连:杂散可读事件(兴趣集已无 EPOLLIN,防御性忽略) */
+                if (!(events[i].events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP))) {
+                    continue;
+                }
+
                 close(cfd); /* close 自动从 epoll 摘除 */
+                if (pending) {
+                    /* 鉴权中途对端断开:不算连接关闭,算鉴权失败 */
+                    auth_remove(cfd);
+                    auth_fail_bump();
+                    continue;
+                }
                 __sync_sub_and_fetch(&g_total_alive, 1);
                 __sync_add_and_fetch(&g_total_close, 1);
                 __sync_sub_and_fetch(&g_per_port[pidx], 1);
@@ -293,6 +454,27 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
                     break;
                 }
                 tune_socket(cfd);
+                /* v1.0.6 鉴权:accept 即发 banner,连接进"鉴权中"状态;
+                 * 通过前不计 alive/acc,失败关连接只计 auth_fail。 */
+                if (g_pass) {
+                    if (write(cfd, AUTH_BANNER_S, sizeof(AUTH_BANNER_S) - 1)
+                            != (ssize_t)(sizeof(AUTH_BANNER_S) - 1) ||
+                        auth_add(cfd, time(NULL) + AUTH_TIMEOUT) != 0) {
+                        close(cfd);
+                        auth_fail_bump();
+                        continue;
+                    }
+                    memset(&ev, 0, sizeof(ev));
+                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                    ev.data.u64 = CONN_TAG | ((uint64_t)port_idx << 32) | (uint32_t)cfd;
+                    if (epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+                        perror("epoll_ctl ADD conn");
+                        auth_remove(cfd);
+                        close(cfd);
+                        continue;
+                    }
+                    continue; /* 等鉴权行,不计任何连接数 */
+                }
                 /* 连接 fd 挂 epoll:只盯断开/错误,不监听 EPOLLIN(不收数据) */
                 memset(&ev, 0, sizeof(ev));
                 ev.events = EPOLLRDHUP | EPOLLERR | EPOLLHUP;

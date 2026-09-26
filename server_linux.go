@@ -24,12 +24,16 @@ import (
 )
 
 // runServer 进入 C 服务端主循环(等价旧版 ./server),阻塞至 SIGINT/SIGTERM。
-func runServer(ports []string) error {
+// pass 非空时经 argv 传给 C 侧("-pass <密码>",C 侧解析后启用鉴权)。
+func runServer(ports []string, pass string) error {
 	if len(ports) == 0 {
 		return fmt.Errorf("服务器模式需要至少一个端口: tcp-stress -s <port1> [port2] ...")
 	}
 	if len(ports) > 64 {
 		return fmt.Errorf("too many ports, limit=64")
+	}
+	if err := validatePass(pass); err != nil {
+		return fmt.Errorf("-pass %v", err)
 	}
 	for _, p := range ports {
 		if !isValidPort(p) {
@@ -38,8 +42,11 @@ func runServer(ports []string) error {
 	}
 
 	// C 侧沿用旧版 argv 约定:argv[0]=程序名,端口从 argv[1] 起
-	argv := make([]*C.char, 0, len(ports)+1)
+	argv := make([]*C.char, 0, len(ports)+3)
 	argv = append(argv, C.CString("tcp-stress"))
+	if pass != "" {
+		argv = append(argv, C.CString("-pass"), C.CString(pass))
+	}
 	for _, p := range ports {
 		argv = append(argv, C.CString(p))
 	}

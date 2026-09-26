@@ -39,6 +39,7 @@ type goServer struct {
 	alive      atomic.Int64
 	totalAcc   atomic.Uint64
 	totalClose atomic.Uint64
+	authFail   atomic.Uint64
 	perPort    []atomic.Int64
 	ports      []int
 	conns      sync.Map // net.Conn -> int(portIdx)
@@ -71,9 +72,12 @@ func (s *goServer) hold(ctx context.Context, c net.Conn, idx int) {
 	s.perPort[idx].Add(-1)
 }
 
-func runServer(ports []string) error {
+func runServer(ports []string, pass string) error {
 	if len(ports) == 0 {
 		return fmt.Errorf("服务器模式需要至少一个端口: tcp-stress -s <port1> [port2] ...")
+	}
+	if err := validatePass(pass); err != nil {
+		return fmt.Errorf("-pass %v", err)
 	}
 	if len(ports) > 64 {
 		return fmt.Errorf("too many ports, limit=64")
@@ -127,13 +131,21 @@ func runServer(ports []string) error {
 				if tc, ok := c.(*net.TCPConn); ok {
 					s.tune(tc)
 				}
-				s.conns.Store(c, idx)
-				s.alive.Add(1)
-				s.totalAcc.Add(1)
-				s.perPort[idx].Add(1)
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
+					// 鉴权:通过才计数(失败连接不进 conns 表、不占统计)
+					if pass != "" {
+						if !serverAuth(c, pass) {
+							s.authFail.Add(1)
+							_ = c.Close()
+							return
+						}
+					}
+					s.conns.Store(c, idx)
+					s.alive.Add(1)
+					s.totalAcc.Add(1)
+					s.perPort[idx].Add(1)
 					s.hold(ctx, c, idx)
 				}()
 			}
@@ -159,15 +171,18 @@ func runServer(ports []string) error {
 					fmt.Fprintf(&pb, " %d=%d", p, s.perPort[i].Load())
 				}
 				fmt.Fprintf(os.Stderr,
-					"[STATS t=%ds] alive=%d | total_acc=%d total_close=%d | +%d/s -%d/s\n"+
+					"[STATS t=%ds] alive=%d | total_acc=%d total_close=%d | +%d/s -%d/s | auth_fail=%d\n"+
 						"         ports:%s\n",
 					time.Now().Unix(), s.alive.Load(), acc, cl,
-					acc-prevAcc, cl-prevClose, pb.String())
+					acc-prevAcc, cl-prevClose, s.authFail.Load(), pb.String())
 				prevAcc, prevClose = acc, cl
 			}
 		}
 	}()
 
+	if pass != "" {
+		fmt.Fprintln(os.Stderr, "auth: enabled (password set)")
+	}
 	fmt.Fprintln(os.Stderr, "server running, ctrl-c to stop.")
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "shutting down...")

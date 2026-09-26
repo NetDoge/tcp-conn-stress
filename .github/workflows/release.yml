@@ -1,12 +1,13 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.5
+#   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
 # 单一二进制 tcp-stress(-s 服务端 / -c 客户端),全平台全功能:
-#   - Linux:  cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
-#   - 其他平台: 纯 Go 服务端(server_go.go),行为与 C 版对齐
+#   - Linux(amd64/arm64): cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
+#   - 其他平台 + linux/armv7l: 纯 Go 服务端(server_go.go),行为与 C 版对齐
+# v1.0.6:-pass 鉴权、零参数 TUI、linux-armv7l 产物
 on:
   push:
     tags: ['v*']
@@ -15,7 +16,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.5'
+        default: 'v1.0.6'
 
 permissions:
   contents: read
@@ -29,6 +30,7 @@ jobs:
         include:
           - { name: linux-amd64,   goos: linux,   goarch: amd64 }
           - { name: linux-arm64,   goos: linux,   goarch: arm64, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu }
+          - { name: linux-armv7l,  goos: linux,   goarch: arm, goarm: '7' }
           - { name: darwin-amd64,  goos: darwin,  goarch: amd64 }
           - { name: darwin-arm64,  goos: darwin,  goarch: arm64 }
           - { name: windows-amd64, goos: windows, goarch: amd64 }
@@ -53,14 +55,16 @@ jobs:
           # 版本号:tag 触发取 tag 名,手动触发取输入
           V='${{ github.event.inputs.version || github.ref_name }}'
           echo "building version: ${V}"
-          if [ '${{ matrix.goos }}' = 'linux' ]; then
+          if [ '${{ matrix.goos }}' = 'linux' ] && [ '${{ matrix.goarch }}' != 'arm' ]; then
             # cgo 静态构建:C 服务端经 server_linux.go 编入,交叉时 CC 指向交叉工具链
             CGO_ENABLED=1 CC='${{ matrix.cc || 'gcc' }}' GOARCH='${{ matrix.goarch }}' \
               go build -trimpath -tags 'osusergo netgo' \
               -ldflags "-s -w -extldflags -static -X main.version=${V}" -o "tcp-stress${ext}" .
           else
-            # darwin/windows:纯 Go 服务端(server_go.go),全功能
-            CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
+            # darwin/windows/linux-armv7l:纯 Go 服务端(server_go.go),全功能
+            GOARM_FLAG=''
+            if [ '${{ matrix.goarch }}' = 'arm' ]; then GOARM_FLAG='GOARM=7'; fi
+            env CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' $GOARM_FLAG \
               go build -trimpath -ldflags "-s -w -X main.version=${V}" -o "tcp-stress${ext}" .
           fi
 
@@ -70,6 +74,10 @@ jobs:
           if [ '${{ matrix.goos }}' = 'linux' ]; then
             readelf -h tcp-stress | grep -E 'Class|Machine'
             if [ '${{ matrix.goarch }}' = 'amd64' ]; then ./tcp-stress -v; fi
+            if [ '${{ matrix.goarch }}' = 'arm' ]; then
+              readelf -h tcp-stress | grep -q 'Machine:.*ARM' || { echo 'FAIL: not ARM'; exit 1; }
+              readelf -h tcp-stress | grep -q 'Class:.*ELF32' || { echo 'FAIL: not ELF32'; exit 1; }
+            fi
           else
             # file -b:输出不带文件名前缀,不会被 GitHub 误当注解
             for f in tcp-stress tcp-stress.exe; do
@@ -194,6 +202,66 @@ jobs:
           kill -INT $SRV
           grep -q 'bye. final alive' sg.log || { echo "FAIL: Go 服务端退出异常"; exit 1; }
           echo 'GO SERVER PASS'
+
+      - name: 鉴权矩阵测试
+        run: |
+          # A1 正确密码全流程
+          ./tcp-stress -s -pass s3cret 18888 18889 > sa.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889" -pass s3cret \
+            -target 50 -rate 50 > ca1.log 2>&1 &
+          CLI=$!
+          sleep 4
+          kill -INT $CLI; sleep 2; kill -INT $SRV; sleep 0.5
+          grep -q 'auth: enabled' sa.log || { echo 'FAIL: 服务端未启用鉴权'; exit 1; }
+          grep -q 'final: try=50 ok=50' ca1.log || { echo 'FAIL: 鉴权连接未成功'; exit 1; }
+          grep -q 'auth_fail=0' sa.log || { echo 'FAIL: auth_fail 应为 0'; exit 1; }
+          # A2 错误密码:10 连败中止
+          ./tcp-stress -s -pass s3cret 18888 > sa2.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -pass wrongpw -target 20 -rate 20 \
+            > ca2.log 2>&1 && { echo 'FAIL: 错密码应非零退出'; exit 1; } || true
+          grep -q '鉴权连续失败 10 次' ca2.log || { echo 'FAIL: 未报连败中止'; exit 1; }
+          sleep 1; grep -q 'auth_fail=[1-9]' sa2.log || { echo 'FAIL: 服务端未计 auth_fail'; exit 1; }
+          kill -INT $SRV; sleep 0.5
+          # A3 无密码客户端被 banner 检出
+          ./tcp-stress -s -pass s3cret 18888 > sa3.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -target 5 -rate 5 \
+            > ca3.log 2>&1 && { echo 'FAIL: 无密码应非零退出'; exit 1; } || true
+          grep -q '服务器要求鉴权' ca3.log || { echo 'FAIL: banner 未检出'; exit 1; }
+          kill -INT $SRV; sleep 0.5
+          # A4 服务端无密码 + 客户端带密码:忽略并正常跑
+          ./tcp-stress -s 18888 > sa4.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -pass x -target 20 -rate 20 > ca4.log 2>&1 &
+          CLI=$!
+          sleep 4
+          kill -INT $CLI; sleep 2; kill -INT $SRV
+          grep -q 'pass 已忽略' ca4.log || { echo 'FAIL: 未提示忽略'; exit 1; }
+          grep -q 'final: try=20 ok=20' ca4.log || { echo 'FAIL: 忽略密码后未正常连接'; exit 1; }
+          echo 'AUTH MATRIX PASS'
+
+      - name: TUI 冒烟(向导可进可退,非终端不误入)
+        run: |
+          # pty 里 q 正常退出(向导 banner 出现)
+          printf 'q\n' | script -qec "./tcp-stress" /dev/null > tui1.log 2>&1
+          grep -q '压测向导' tui1.log || { echo 'FAIL: TUI 未进入'; exit 1; }
+          # 管道/重定向:usage exit 2,不挂住
+          ./tcp-stress < /dev/null > tui2.log 2>&1
+          [ $? -eq 2 ] || { echo 'FAIL: 非终端裸调用应 exit 2'; exit 1; }
+          echo 'TUI SMOKE PASS'
+
+      - name: armv7l 交叉构建检查
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -o tcp-stress-armv7l .
+          readelf -h tcp-stress-armv7l | grep -q 'Machine:.*ARM' || { echo 'FAIL: not ARM'; exit 1; }
+          readelf -h tcp-stress-armv7l | grep -q 'Class:.*ELF32' || { echo 'FAIL: not ELF32'; exit 1; }
+          echo 'ARMV7L BUILD PASS'
 
       - name: fd 软上限自动抬升测试
         run: |
