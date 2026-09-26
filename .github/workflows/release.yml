@@ -1,17 +1,21 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.0
+#   1) 推 tag 触发:  git push origin v1.0.1
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
+#
+# v1.0.1 起单一二进制 tcp-stress(-s 服务端 / -c 客户端):
+#   - Linux:  cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
+#   - 其他平台: epoll 不可用,CGO_ENABLED=0 只含客户端,-s 明确报错
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号(tag),如 v1.0.0'
+        description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.0'
+        default: 'v1.0.1'
 
 permissions:
   contents: read
@@ -23,12 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 服务端依赖 epoll,只发 Linux;客户端全平台
-          - { name: linux-amd64,   goos: linux,   goarch: amd64, cc: gcc,                   apt: '',                     server: true }
-          - { name: linux-arm64,   goos: linux,   goarch: arm64, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu,  server: true }
-          - { name: darwin-amd64,  goos: darwin,  goarch: amd64, server: false }
-          - { name: darwin-arm64,  goos: darwin,  goarch: arm64, server: false }
-          - { name: windows-amd64, goos: windows, goarch: amd64, server: false }
+          - { name: linux-amd64,   goos: linux,   goarch: amd64 }
+          - { name: linux-arm64,   goos: linux,   goarch: arm64, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu }
+          - { name: darwin-amd64,  goos: darwin,  goarch: amd64 }
+          - { name: darwin-arm64,  goos: darwin,  goarch: arm64 }
+          - { name: windows-amd64, goos: windows, goarch: amd64 }
     steps:
       - uses: actions/checkout@v7
 
@@ -43,28 +46,29 @@ jobs:
           go-version: '1.23'
           cache: false
 
-      - name: 编译服务端 (C, 静态)
-        if: matrix.server
-        run: |
-          make CC='${{ matrix.cc }}' \
-               CFLAGS='-O2 -s -Wall -Wextra -pthread' \
-               LDFLAGS='-pthread -static'
-
-      - name: 编译客户端 (Go)
+      - name: 编译
         run: |
           ext=''
           if [ '${{ matrix.goos }}' = 'windows' ]; then ext='.exe'; fi
-          CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
-            go build -trimpath -ldflags '-s -w' -o "client${ext}" .
+          if [ '${{ matrix.goos }}' = 'linux' ]; then
+            # cgo 静态构建:C 服务端经 server_linux.go 编入,交叉时 CC 指向交叉工具链
+            CGO_ENABLED=1 CC='${{ matrix.cc || 'gcc' }}' GOARCH='${{ matrix.goarch }}' \
+              go build -trimpath -tags 'osusergo netgo' \
+              -ldflags '-s -w -extldflags -static' -o "tcp-stress${ext}" .
+          else
+            # darwin/windows:epoll 不可用,服务端替换为 stub(server_stub.go),纯 Go
+            CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
+              go build -trimpath -ldflags '-s -w' -o "tcp-stress${ext}" .
+          fi
 
-      - name: 校验产物架构
+      - name: 校验产物
         run: |
           ls -lh
           if [ '${{ matrix.goos }}' = 'linux' ]; then
-            readelf -h server client | grep -E 'Class|Machine'
+            readelf -h tcp-stress | grep -E 'Class|Machine'
           else
-            # 注意用 file -b:不带文件名前缀的输出不会被 GitHub 误当注解
-            for f in client client.exe; do
+            # file -b:输出不带文件名前缀,不会被 GitHub 误当注解
+            for f in tcp-stress tcp-stress.exe; do
               [ -f "$f" ] && file -b "$f"
             done
             true
@@ -74,12 +78,10 @@ jobs:
         run: |
           mkdir -p out
           V='${{ matrix.name }}'
-          if [ -f server ]; then
-            tar -czf "out/tcp-conn-stress-${V}.tar.gz" server client README.md
-          elif [ -f client.exe ]; then
-            zip -q "out/tcp-conn-stress-${V}.zip" client.exe README.md
+          if [ -f tcp-stress.exe ]; then
+            zip -q "out/tcp-conn-stress-${V}.zip" tcp-stress.exe README.md
           else
-            tar -czf "out/tcp-conn-stress-${V}.tar.gz" client README.md
+            tar -czf "out/tcp-conn-stress-${V}.tar.gz" tcp-stress README.md
           fi
           ls -lh out
 
@@ -99,25 +101,26 @@ jobs:
           go-version: '1.23'
           cache: false
 
-      - name: 编译
-        run: |
-          make CFLAGS='-O2 -s -Wall -Wextra -pthread' LDFLAGS='-pthread -static'
-          CGO_ENABLED=0 go build -o client .
+      - name: 编译(与发布同款静态 cgo 构建)
+        run: make
 
       - name: 参数校验
         run: |
-          ./client -servers 127.0.0.1:1 -rate 50001 2>&1 | grep -q 'rate too large'
-          ./client -servers 127.0.0.1:1 -keepalive -1s 2>&1 | grep -q 'keepalive must be'
+          ./tcp-stress -c -servers 127.0.0.1:1 -rate 50001 2>&1 | grep -q 'rate too large'
+          ./tcp-stress -c -servers 127.0.0.1:1 -keepalive -1s 2>&1 | grep -q 'keepalive must be'
+          ./tcp-stress -s 99999 2>&1 | grep -q 'invalid port'
+          ./tcp-stress -s 2>&1 | grep -q '至少一个端口'
 
       # 135s:故意跨过旧版 120s 读超时 bug 的阈值。
       # 旧版会在此时限内把健康连接全杀一轮(try 远超 target),
       # 这类"长跑才炸"的回归短冒烟测不出来,必须有长测兜底。
       - name: 回环长测(135s,防误杀重拨回归)
         run: |
-          ./server 18888 18889 > s.log 2>&1 &
+          ./tcp-stress -s 18888 18889 > s.log 2>&1 &
           echo $! > srv.pid
           sleep 0.5
-          ./client -servers "127.0.0.1:18888,127.0.0.1:18889"                    -target 100 -rate 100 > c.log 2>&1 &
+          ./tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889" \
+                    -target 100 -rate 100 > c.log 2>&1 &
           echo $! > cli.pid
           sleep 135
           kill -INT "$(cat cli.pid)"
@@ -134,10 +137,11 @@ jobs:
 
       - name: 服务端回收测试(kill -9 客户端)
         run: |
-          ./server 18888 18889 > s2.log 2>&1 &
+          ./tcp-stress -s 18888 18889 > s2.log 2>&1 &
           echo $! > srv2.pid
           sleep 0.5
-          ./client -servers "127.0.0.1:18888,127.0.0.1:18889"                    -target 50 -rate 50 > c2.log 2>&1 &
+          ./tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889" \
+                    -target 50 -rate 50 > c2.log 2>&1 &
           CLI2=$!
           sleep 4
           kill -9 $CLI2

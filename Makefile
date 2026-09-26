@@ -1,26 +1,23 @@
-# Makefile - 家用宽带极限 TCP 连接测试 - 服务端
+# Makefile - tcp-conn-stress 单二进制构建
 #
-# 用法:
-#   make            # 编译
-#   make clean      # 清理
+#   make        静态构建(发布形态:cgo 内嵌 C 服务端,不挑 glibc)
+#   make dyn    动态构建(本机调试,编译快)
+#   make clean  清理
+#
+# 非 Linux 平台没有 epoll,服务端不参与编译(server_stub.go 接管),
+# 那边交叉编译用:
+#   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress .
 
-CC      ?= gcc
-CFLAGS  ?= -O2 -g -Wall -Wextra -pthread
-# 默认静态链接,产物可直接拷到别的机器跑(不挑 glibc 版本)。
-# 本地调试想去掉静态链接:make LDFLAGS=-pthread
-LDFLAGS ?= -pthread -static
+BINARY = tcp-stress
 
-TARGET  = server
+.PHONY: all dyn clean
 
-.PHONY: all clean run
+all:
+	CGO_ENABLED=1 go build -trimpath -tags 'osusergo netgo' \
+	  -ldflags '-s -w -extldflags -static' -o $(BINARY) .
 
-all: $(TARGET)
-
-$(TARGET): server.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-
-run: $(TARGET)
-	./$(TARGET) 8888 8889 8890
+dyn:
+	CGO_ENABLED=1 go build -o $(BINARY) .
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(BINARY)

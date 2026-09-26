@@ -1,8 +1,14 @@
-# 家用宽带极限 TCP 连接测试 (C/S)
+# 家用宽带极限 TCP 连接测试 (tcp-stress)
 
 测试家用宽带 / 路由器 / NAT 设备在不交换业务数据的前提下,能维持多少个并发 TCP 长连接。
-- 服务端:C + epoll,多端口监听,极致内存
-- 客户端:Go,token-bucket 限速,自动多端口轮询
+**v1.0.1 起合并为单二进制 `tcp-stress`**:
+- `-s` 服务器模式:C + epoll(cgo 内嵌),多端口监听,极致内存,仅 Linux
+- `-c` 客户端模式:纯 Go,token-bucket 限速,自动多端口轮询,全平台
+
+```bash
+tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端)
+tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -target 100000 -rate 200
+```
 
 ---
 
@@ -10,12 +16,20 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `server.c` | 多端口 epoll 服务端,KeepAlive 抗 NAT 老化 |
-| `Makefile` | C 端编译脚本(默认静态链接) |
+| `main.go` | 单二进制入口,`-s`/`-c` 模式分发与 flag 定义 |
+| `csrc/server.c` | C 服务端实现(多端口 epoll,KeepAlive 抗 NAT 老化) |
+| `server_linux.go` | cgo 桥:Linux 构建把 C 服务端编进二进制 |
+| `server_stub.go` | 非 Linux / 纯 Go 构建的服务端占位(`-s` 明确报错) |
 | `client.go` | Go 客户端主逻辑,轮询打满多端口 |
 | `sockopt_unix.go` / `sockopt_windows.go` | 平台相关的底层 socket 调优(按 build tag 二选一) |
+| `Makefile` | 构建脚本(静态 cgo 构建) |
 | `go.mod` | Go module 定义 |
 | `.github/workflows/release.yml` | 云编译 + 自动发 Release |
+
+> C 源码放 `csrc/` 子目录是刻意的:目录里直接有 `.c` 文件时,
+> `CGO_ENABLED=0 go build .` 会报 "C source files not allowed",
+> 所有纯 Go 构建(交叉编译 darwin/windows)都会炸。由 cgo 前导
+> `#include "csrc/server.c"` 引入,非 Linux 构建完全不碰它。
 
 ---
 
@@ -67,49 +81,46 @@ ss -s                            # TCP 各状态连接数
 
 ## 二、编译
 
-### 2.1 C 服务端
+### 2.1 Linux(全功能,含 C 服务端)
 
 ```bash
-make              # gcc -O2 -Wall -pthread
-./server 8888 8889 8890        # 起三个监听端口
+make            # 静态 cgo 构建,产物不挑 glibc,可直接拷到别的机器
+make dyn        # 动态构建,本机调试编译快
 ```
 
-### 2.2 Go 客户端
+需要 gcc + Go 1.19+。手动等价:
 
 ```bash
-go build -o client .        # 在项目目录内编译
+CGO_ENABLED=1 go build -trimpath -tags 'osusergo netgo' \
+  -ldflags '-s -w -extldflags -static' -o tcp-stress .
 ```
 
-> 注意是 `go build -o client .`,**不要**写 `go build client.go`。
-> 目录里 `sockopt_unix.go` / `sockopt_windows.go` 按平台二选一参与编译,
-> 只指定 `client.go` 会缺 `setSmallBuf` 符号。
-
-需要 Go 1.19+(用到 `sync/atomic.Uint64`)。
-
-交叉编译到其他平台(客户端与服务端不同,服务端只能在 Linux 跑):
+### 2.2 其他平台(仅客户端)
 
 ```bash
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o client.exe .
-CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o client     .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o tcp-stress.exe .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress     .
 ```
+
+epoll 是 Linux 独有,darwin / windows 的二进制不含服务端,`-s` 会明确报错。
 
 ### 2.3 直接用 Release 里的预编译产物
 
-每次打 tag 会由 GitHub Actions 云编译并发布到 Releases,无需本地工具链:
+每次打 tag 由 GitHub Actions 云编译并发布到 Releases,无需本地工具链:
 
 | 产物 | 内容 | 适用 |
 | --- | --- | --- |
-| `tcp-conn-stress-linux-amd64.tar.gz` | `server` + `client` | x86_64 Linux |
-| `tcp-conn-stress-linux-arm64.tar.gz` | `server` + `client` | ARM64 Linux(树莓派等) |
-| `tcp-conn-stress-darwin-amd64.tar.gz` | `client` | Intel Mac |
-| `tcp-conn-stress-darwin-arm64.tar.gz` | `client` | Apple Silicon Mac |
-| `tcp-conn-stress-windows-amd64.zip` | `client.exe` | Windows |
+| `tcp-conn-stress-linux-amd64.tar.gz` | `tcp-stress`(全功能) | x86_64 Linux |
+| `tcp-conn-stress-linux-arm64.tar.gz` | `tcp-stress`(全功能) | ARM64 Linux(树莓派等) |
+| `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(仅客户端) | Intel Mac |
+| `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(仅客户端) | Apple Silicon Mac |
+| `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(仅客户端) | Windows |
 | `SHA256SUMS.txt` | 校验和 | 全部 |
 
 想自己触发一次云编译,推个 tag 即可:
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.1 && git push origin v1.0.1
 ```
 
 ---
@@ -120,11 +131,11 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ```bash
 # 终端 A:服务端,4 个端口
-./server 18888 18889 18890 18891
+tcp-stress -s 18888 18889 18890 18891
 
 # 终端 B:客户端,打到 5 万连接,400 conn/s
-./client -servers "127.0.0.1:18888,127.0.0.1:18889,127.0.0.1:18890,127.0.0.1:18891" \
-          -target 50000 -rate 400 -stats 1s
+tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889,127.0.0.1:18890,127.0.0.1:18891" \
+                 -target 50000 -rate 400 -stats 1s
 ```
 
 ### 3.2 跨机器测家用宽带(典型用法)
@@ -133,20 +144,20 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ```bash
 # 内网服务端:多端口
-./server 18888 18889 18890 18891 18892 18893 18894 18895
+tcp-stress -s 18888 18889 18890 18891 18892 18893 18894 18895
 ```
 
 另一台机器(可同内网、可公网 VPS)当客户端:
 
 ```bash
 # 跨网:目标打 10w,默认 200 conn/s(避开运营商 QoS 突发限速)
-./client -servers "192.168.1.100:18888,192.168.1.100:18889,...,192.168.1.100:18895" \
-          -target 100000 -rate 200
+tcp-stress -c -servers "192.168.1.100:18888,192.168.1.100:18889,...,192.168.1.100:18895" \
+                 -target 100000 -rate 200
 
 # 多 WAN / 策略路由:指定出口 IP
-./client -bind 192.168.10.5 \
-          -servers "1.2.3.4:18888,1.2.3.4:18889" \
-          -target 80000 -rate 150
+tcp-stress -c -bind 192.168.10.5 \
+                 -servers "1.2.3.4:18888,1.2.3.4:18889" \
+                 -target 80000 -rate 150
 ```
 
 ### 3.3 观察指标
@@ -173,7 +184,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ## 四、设计要点速览
 
-### 服务端(`server.c`)
+### 服务端(`csrc/server.c`,经 `server_linux.go` cgo 编入)
 - 一个 `epoll_create1` 实例管理**所有**监听 fd,`accept4` 一次性 accept loop 到 `EAGAIN`
 - 已建连 socket 也注册进同一个 epoll(只盯 `EPOLLRDHUP/EPOLLERR/EPOLLHUP`,不收数据)→ 对端断开即回收,`alive`/`total_close`/分端口计数都是真值
 - `accept4` 遇 `EMFILE/ENFILE`:摘下 listener 1s 再挂回 + 10s 限频日志,fd 耗尽不空转
@@ -181,6 +192,12 @@ git tag v1.0.0 && git push origin v1.0.0
 - `SO_KEEPALIVE` + `TCP_KEEPIDLE=60 / KEEPINTVL=10 / KEEPCNT=3` → 客户端静默 60s 后开始探测,30s 内判定对端死,触发本端发 RST
   - 与运营商 NAT 老化(典型 120-300s)留出余量
 - 退出时遍历 `/proc/self/fd` 逐个 close 已建连 socket → 客户端收到 FIN 而非 RST,`active` 优雅归零
+
+### cgo 合并方式
+- `server.c` 全部符号 `static`,经 `#include "csrc/server.c"` 编入 cgo 生成的编译单元,不产生包级符号,无重复定义
+- `-D_GNU_SOURCE=1` 由 cgo CFLAGS 命令行注入,保证 `accept4` 等扩展在 include 任何头之前就可见
+- Go 侧 `runServer` 把端口列表拼成 argv 传给 `tcp_server_main(argc, argv)`,进入后**不再回到 Go 运行时**(C 主循环自带 SIGINT/SIGTERM 处理)
+- `server_stub.go`(`//go:build !linux || !cgo`)保证纯 Go 构建可编译、`-s` 报错清晰
 
 ### 客户端(`client.go`)
 - `net.Dialer.Control` 走 `syscall.RawConn.Control(fd)` → 在内核 fd 上 `SetsockoptInt` 压缓冲区
@@ -206,3 +223,10 @@ git tag v1.0.0 && git push origin v1.0.0
 - 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
 - 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
 - CI 含同款长测,每次发版自动跑
+
+2026-09-26 v1.0.1 合并轮(单二进制):
+
+- 分发/参数校验 6 项:无参 usage、`-s -c` 互斥、`-s` 无端口/非法端口拒绝、纯 Go 构建下 `-s` 报 stub 错、`-c` 参数校验不变
+- 8 端口 800 连接:alive=800 精确 8 等分,双端优雅退出(rc=0)
+- `kill -9` 客户端:cgo 化后服务端仍 3s 内 `alive=0 total_close=100`
+- 60s 稳态:`try` 峰值 = 200 = target,零重拨

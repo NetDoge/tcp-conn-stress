@@ -1,8 +1,9 @@
-// client.go - 家用宽带极限 TCP 连接测试客户端
+// client.go - 家用宽带极限 TCP 连接测试客户端(纯 Go)
 //
-// 编译:  go build -o client .
-// 运行:  ./client -servers "192.168.1.100:8888,192.168.1.100:8889" \
-//                 -target 100000 -rate 200
+// v1.0.1 起与 C 服务端合并为单二进制 tcp-stress,本文件是客户端模式(-c)的实现,
+// 入口与 flag 定义见 main.go:
+//   ./tcp-stress -c -servers "192.168.1.100:8888,192.168.1.100:8889" \
+//                      -target 100000 -rate 200
 //
 // 特性:
 //   - 多端口轮询,每端口打到内核临时端口上限时切下一个
@@ -15,7 +16,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -27,6 +27,16 @@ import (
 	"syscall"
 	"time"
 )
+
+// clientConfig 由 main.go 的 flag 填好传入;参数校验在 runClient 内做。
+type clientConfig struct {
+	servers   string
+	bind      string
+	target    uint64
+	rate      int
+	keepAlive time.Duration
+	statsInt  time.Duration
+}
 
 type target struct {
 	ip   string
@@ -188,37 +198,30 @@ func holdConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func main() {
-	var (
-		servers   = flag.String("servers", "127.0.0.1:8888", "目标地址列表,逗号分隔,格式 IP:Port")
-		bind      = flag.String("bind", "", "本地出口 IP(多 WAN/策略路由时指定)")
-		target    = flag.Uint64("target", 10000, "目标总连接数(到达后保持)")
-		rate      = flag.Int("rate", 200, "每秒建连速率上限")
-		keepAlive = flag.Duration("keepalive", 30*time.Second, "TCP KeepAlive 间隔")
-		statsInt  = flag.Duration("stats", 1*time.Second, "统计打印周期")
-	)
-	flag.Parse()
+func runClient(cfg clientConfig) {
+	rate, target := cfg.rate, cfg.target
+	keepAlive, statsInt := cfg.keepAlive, cfg.statsInt
 
-	if *rate <= 0 {
+	if rate <= 0 {
 		log.Fatalf("rate must be > 0")
 	}
-	if *target == 0 {
+	if target == 0 {
 		log.Fatalf("target must be > 0")
 	}
-	if *statsInt <= 0 {
+	if statsInt <= 0 {
 		log.Fatalf("stats interval must be > 0")
 	}
-	if *rate > 50000 {
+	if rate > 50000 {
 		log.Fatalf("rate too large (max 50000)")
 	}
-	if *keepAlive < 0 {
+	if keepAlive < 0 {
 		log.Fatalf("keepalive must be >= 0 (0 = Go default 15s)")
 	}
-	if *keepAlive > 10*time.Minute {
+	if keepAlive > 10*time.Minute {
 		log.Fatalf("keepalive too long (max 10m)")
 	}
 
-	targets, err := parseTargets(*servers)
+	targets, err := parseTargets(cfg.servers)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -226,8 +229,8 @@ func main() {
 	for _, t := range targets {
 		log.Printf("  - %s:%d", t.ip, t.port)
 	}
-	if *bind != "" {
-		log.Printf("bind local ip: %s", *bind)
+	if cfg.bind != "" {
+		log.Printf("bind local ip: %s", cfg.bind)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -239,12 +242,12 @@ func main() {
 		cancel()
 	}()
 
-	d := newDialer(*bind, *keepAlive)
+	d := newDialer(cfg.bind, keepAlive)
 
 	// 令牌桶
-	tokens := make(chan struct{}, *rate)
+	tokens := make(chan struct{}, rate)
 	go func() {
-		t := time.NewTicker(time.Second / time.Duration(*rate))
+		t := time.NewTicker(time.Second / time.Duration(rate))
 		defer t.Stop()
 		for {
 			select {
@@ -260,14 +263,14 @@ func main() {
 	}()
 
 	// worker 数:与 rate 解耦。少点也不会拖慢,多了只是空转抢 token。
-	workerN := *rate
+	workerN := rate
 	if workerN > 256 {
 		workerN = 256
 	}
 	if workerN < 16 {
 		workerN = 16
 	}
-	log.Printf("workers=%d, rate=%d conn/s, target=%d", workerN, *rate, *target)
+	log.Printf("workers=%d, rate=%d conn/s, target=%d", workerN, rate, target)
 
 	// hold 计数:每次成功 dial 起一个 holdConn goroutine,它在退出前 Done 一次。
 	// 主线程 hold.Wait() 等所有连接清理完再打 final。
@@ -286,7 +289,7 @@ func main() {
 					if ctx.Err() != nil {
 						return
 					}
-					if st.active.Load() >= int64(*target) {
+					if st.active.Load() >= int64(target) {
 						// 已达目标,让出 CPU,等 ctx 结束
 						time.Sleep(100 * time.Millisecond)
 						continue
@@ -308,7 +311,7 @@ func main() {
 
 	// 统计打印
 	go func() {
-		t := time.NewTicker(*statsInt)
+		t := time.NewTicker(statsInt)
 		defer t.Stop()
 		var lastTry, lastOk uint64
 		for {

@@ -8,15 +8,18 @@
  *   - 启用 SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT,60s 抗 NAT 老化
  *   - 独立统计线程:每秒打印总数/分端口/每秒增/减
  *
- * 用法:
- *   ./server <port1> [port2] [port3] ...
- *   ./server 8888 8889 8890
+ * 用法(已合并进 tcp-stress 单二进制,本文件由 cgo 前导 include):
+ *   ./tcp-stress -s <port1> [port2] [port3] ...
+ *   ./tcp-stress -s 8888 8889 8890
  *
  * 退出:
  *   SIGINT / SIGTERM 触发优雅退出,关闭所有 fd。
  */
 
+/* cgo 构建时 -D_GNU_SOURCE=1 由命令行注入,这里 guard 住避免重定义告警 */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,9 +158,12 @@ static void *stats_thread(void *arg) {
     return NULL;
 }
 
-int main(int argc, char **argv) {
+/* 入口由 Go 侧 main.go 经 cgo 调用。
+ * static: cgo 会把本前导复制进多个生成的 C 文件,static 保证各编译单元私有,
+ *         不会在链接期撞重复符号;unused 压掉未调用 TU 的告警。 */
+__attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <port1> [port2] ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s -s <port1> [port2] ...\n", argv[0]);
         return 1;
     }
     if (argc - 1 > MAX_LISTENERS) {
