@@ -35,17 +35,36 @@ tcp-stress -h                                # 帮助(-help 同义,exit 0)
 
 ---
 
-## 一、Linux 系统调优(必做,否则根本起不来 10w+)
+## 一、上手即用(零配置)
 
-> 这些是**单台机器**的内核上限,需要在**服务端**和**客户端**两台机器都改(或至少改服务端)。
+**v1.0.4 起无需任何系统调优即可跑**:程序启动时自动把 fd 软上限抬到硬上限
+(普通权限操作,不需要 root),发行版默认环境(soft 1024 / hard 数十万)直接用:
 
 ```bash
-# 1) 用户态 fd 上限 - 当前会话 + 持久化
-ulimit -n 1048576
-echo '* soft nofile 1048576'  > /etc/security/limits.conf
-echo '* hard nofile 1048576'  >> /etc/security/limits.conf
+tcp-stress -s 8888 8889
+tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -target 10000
+```
 
-# 2) 系统级 fd 总数
+启动时会打印实际生效值确认:`fd limit: soft=1048576 hard=1048576`。
+
+**唯一仍需管理员的场景**:fd **硬**上限本身太低(某些容器 / 老系统只有 4096)。
+这不是程序能绕的(soft 只能抬到 hard),需一次性调整:
+
+```bash
+ulimit -H -n 1048576                      # 会话级(需 root)
+# systemd 服务:  [Service] LimitNOFILE=1048576
+# /etc/security/limits.conf:  * hard nofile 1048576
+```
+
+---
+
+## 一b、大规模调优(可选,10 万+ 连接才需要)
+
+> 程序已自动抬 fd 软上限;以下项不影响"能不能跑",只影响 10 万+ 规模的
+> 成功率与性能。两台机器都改(或至少改服务端)。
+
+```bash
+# 1) 系统级 fd 总数
 sysctl -w fs.file-max=2097152
 echo 'fs.file-max = 2097152' >> /etc/sysctl.conf
 
@@ -59,7 +78,8 @@ sysctl -w net.ipv4.tcp_tw_reuse=1
 sysctl -w net.ipv4.tcp_max_syn_backlog=262144
 sysctl -w net.core.somaxconn=262144
 
-# 5) 本地端口范围 - 默认 32768-60999(~28k);要 10w+ 必须扩
+# 5) 本地端口范围 - 默认 32768-60999(~28k/端口);单目标 10w+ 必须扩,
+#    或者直接给 -servers 多配几个端口(每端口独立 ~28k,程序自动轮询)
 sysctl -w net.ipv4.ip_local_port_range='1024 65535'
 
 # 6) conntrack 表(路由器/网关或开了 NAT 的机器需要)
@@ -70,12 +90,11 @@ sysctl -w net.netfilter.nf_conntrack_max=524288
 # (改完需重启;只调 max 不调 hashsize 也能跑,只是哈希偏挤)
 ```
 
-> 重启后 `sysctl.conf` / `limits.conf` 自动生效;已开 ssh 的会话用 `ulimit -n 1048576` 立即抬升。
+> 重启后 `sysctl.conf` 自动生效。
 
 **验证:**
 ```bash
 cat /proc/sys/fs/file-nr        # 第一列应远小于 file-max
-ulimit -n                         # 1048576
 ss -s                            # TCP 各状态连接数
 ```
 
@@ -244,6 +263,13 @@ tcp-stress -c -bind 192.168.10.5 \
 - 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
 - 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
 - CI 含同款长测,每次发版自动跑
+
+2026-09-26 v1.0.4 零配置可用:
+
+- 启动自动把 fd 软上限抬到硬上限(普通权限,无需 root),默认环境免 `ulimit -n`
+- EMFILE 客户端侧显式分类 `fd-full` 并退避(旧版错进 other 且狂打)
+- sysctl 调优降级为"10 万+ 可选";README 重写为上手即用
+- CI 断言:soft 压 256 下 300 连接全部成功(自动抬升生效)
 
 2026-09-26 v1.0.3 版本/帮助参数:
 

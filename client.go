@@ -53,6 +53,7 @@ type stats struct {
 	failTO    atomic.Uint64 // i/o timeout
 	failRST   atomic.Uint64 // connection refused
 	failAddr  atomic.Uint64 // cannot assign requested address (端口耗尽)
+	failFD    atomic.Uint64 // too many open files (fd 耗尽)
 	failEOF   atomic.Uint64 // EOF
 	failOther atomic.Uint64
 	// 维持期间被断开(对端关/链路死):观察 NAT 老化的关键指标
@@ -123,6 +124,8 @@ func classifyErr(err error) {
 		st.failRST.Add(1)
 	case strings.Contains(msg, "cannot assign requested address"):
 		st.failAddr.Add(1)
+	case strings.Contains(msg, "too many open files"):
+		st.failFD.Add(1)
 	case strings.Contains(strings.ToLower(msg), "eof"):
 		st.failEOF.Add(1)
 	default:
@@ -154,8 +157,9 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 		conn, err := d.DialContext(ctx, "tcp", t.addr)
 		if err != nil {
 			classifyErr(err)
-			if strings.Contains(err.Error(), "cannot assign requested address") {
-				// 端口耗尽,不要狂打;也跳过当前端口试下一个
+			if strings.Contains(err.Error(), "cannot assign requested address") ||
+				strings.Contains(err.Error(), "too many open files") {
+				// 端口/fd 耗尽,不要狂打;也跳过当前端口试下一个
 				time.Sleep(50 * time.Millisecond)
 			}
 			continue
@@ -331,10 +335,10 @@ func runClient(cfg clientConfig) {
 				do := uint64(math.Round(float64(curOk-lastOk) / statsInt.Seconds()))
 				lastTry, lastOk = curTry, curOk
 				log.Printf("[STAT] alive=%d try=%d ok=%d closed=%d | +try/s=%d +ok/s=%d | "+
-					"fail t/o=%d rst=%d addr-full=%d eof=%d other=%d",
+					"fail t/o=%d rst=%d addr-full=%d fd-full=%d eof=%d other=%d",
 					st.active.Load(), curTry, curOk, st.closed.Load(), dt, do,
 					st.failTO.Load(), st.failRST.Load(), st.failAddr.Load(),
-					st.failEOF.Load(), st.failOther.Load())
+					st.failFD.Load(), st.failEOF.Load(), st.failOther.Load())
 			}
 		}
 	}()

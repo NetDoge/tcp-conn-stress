@@ -21,6 +21,12 @@ import (
 var version = "dev"
 
 func main() {
+	// fd 软上限自动抬到硬上限:免掉"ulimit -n"部署步骤(普通权限,无需 root)
+	if soft, hard := raiseNofile(); soft > 0 {
+		// 简报放 stderr,不污染 -v/-h 的 stdout 协议
+		fmt.Fprintf(os.Stderr, "fd limit: soft=%d hard=%d\n", soft, hard)
+	}
+
 	var (
 		showVersion bool
 		showHelp    bool

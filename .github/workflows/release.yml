@@ -1,7 +1,7 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.3
+#   1) 推 tag 触发:  git push origin v1.0.4
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
 # v1.0.1 起单一二进制 tcp-stress(-s 服务端 / -c 客户端):
@@ -15,7 +15,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.3'
+        default: 'v1.0.4'
 
 permissions:
   contents: read
@@ -176,6 +176,21 @@ jobs:
           kill -HUP $SRV
           sleep 1
           grep -q 'bye. final alive' s3.log || { echo "FAIL: server SIGHUP 未优雅退出"; exit 1; }
+
+      - name: fd 软上限自动抬升测试
+        run: |
+          ./tcp-stress -s 18888 > s4.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          # soft 压到 256,target 300 > 256:不自动抬必 EMFILE
+          bash -c 'ulimit -S -n 256; exec ./tcp-stress -c -servers 127.0.0.1:18888 -target 300 -rate 100' > c4.log 2>&1 &
+          CLI=$!
+          sleep 6
+          grep -q 'fd limit:' c4.log || { echo "FAIL: 未打印 fd limit"; exit 1; }
+          kill -INT $CLI
+          sleep 2
+          grep -q 'final: try=300 ok=300' c4.log || { echo "FAIL: soft=256 下 300 连接未全部成功(自动抬升未生效)"; exit 1; }
+          kill -INT $SRV
           echo 'SMOKE PASS'
 
   release:
