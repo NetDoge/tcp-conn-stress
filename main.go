@@ -13,6 +13,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
@@ -95,7 +96,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: -pass 与 -passfile 不能同时使用")
 			os.Exit(2)
 		}
-		b, err := os.ReadFile(passFile)
+		// 限读 129 字节(密码上限 128 + 换行):os.ReadFile 会把整个文件
+		// 先读进内存才报"密码最长 128 字节",1GB 文件实测 RSS 冲到 2GB;
+		// 指向 /dev/zero 一类无 EOF 设备更是无界读
+		f, err := os.Open(passFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: 读 -passfile %s: %v\n", passFile, err)
+			os.Exit(2)
+		}
+		b, err := io.ReadAll(io.LimitReader(f, 129))
+		_ = f.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: 读 -passfile %s: %v\n", passFile, err)
 			os.Exit(2)

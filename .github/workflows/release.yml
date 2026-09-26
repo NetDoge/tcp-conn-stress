@@ -4,7 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
-# v1.0.7:审计修复(鉴权槽位驱逐/混合列表/端口校验/双实现对齐/SIGQUIT/-passfile/防过冲)
+# v1.0.8:复审修复(驱逐陈旧事件下溢/驱逐风暴 CPU/banner 迟到自愈/passfile 限读/Go 服务端退出)
 #
 # 单一二进制 tcp-stress(-s 服务端 / -c 客户端),全平台全功能:
 #   - Linux(amd64/arm64): cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
@@ -18,7 +18,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.7'
+        default: 'v1.0.8'
 
 permissions:
   contents: read
@@ -117,6 +117,15 @@ jobs:
 
       - name: 编译(与发布同款静态 cgo 构建)
         run: make VERSION=ci-smoke
+
+      - name: gofmt 检查
+        run: |
+          # -l 列出未格式化文件;空 = 全过。防止格式漂移再积累
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: 以下文件未通过 gofmt:"; echo "$unformatted"; exit 1
+          fi
+          echo 'GOFMT PASS'
 
       - name: 参数校验
         run: |
@@ -348,6 +357,61 @@ jobs:
               srv.wait(timeout=10)
           print('DATA-SEMANTICS PASS')
           PYEOF
+
+          # 7) 驱逐陈旧事件下溢:4200 停滞 + 6 线程洪水 + 配对关最老,
+          #    全程无连接通过鉴权 → alive/total_close 必须恒 0,无 2^64-1 下溢
+          ./tcp-stress -s -pass s3cret 18888 > ar7s.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          python3 - <<'PYEOF'
+          import socket, threading, time, re, signal, subprocess
+          stall = []
+          for i in range(4200):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 18888), timeout=2)
+                  s.settimeout(5); s.recv(64); stall.append(s)
+              except Exception:
+                  break
+          assert len(stall) >= 4100, f'stalled too few: {len(stall)}'
+          stop = [False]
+          def flood():
+              while not stop[0]:
+                  try:
+                      s = socket.create_connection(('127.0.0.1', 18888), timeout=1)
+                      s.settimeout(0.3)
+                      try: s.recv(64)
+                      except Exception: pass
+                      s.close()
+                  except Exception: pass
+          def paired():
+              # connect 之后立即关最老(驱逐首选):制造受害者 RDHUP 与驱逐同批的时序
+              j = 0
+              while not stop[0] and j < len(stall):
+                  try:
+                      c = socket.create_connection(('127.0.0.1', 18888), timeout=1)
+                      stall[j].close(); c.close(); j += 1
+                  except Exception:
+                      j += 1
+          ths = [threading.Thread(target=flood) for _ in range(6)] + [threading.Thread(target=paired)]
+          for t in ths: t.start()
+          time.sleep(10)
+          stop[0] = True
+          for t in ths: t.join(timeout=3)
+          for s in stall:
+              try: s.close()
+              except Exception: pass
+          print('UNDERFLOW-ATTACK DONE')
+          PYEOF
+          kill -INT $SRV; sleep 1
+          # 断言:计数器全程恒零(无任何连接通过鉴权),无下溢特征串
+          if grep -qE 'alive=[1-9]' ar7s.log; then
+            echo 'FAIL: 无鉴权通过却 alive>0'; grep -E 'alive=' ar7s.log | head -3; exit 1
+          fi
+          if grep -q 'total_close=[1-9]' ar7s.log; then
+            echo 'FAIL: 无已建连却有 total_close'; exit 1
+          fi
+          grep -q '4294967295\|18446744073709551615' ar7s.log && { echo 'FAIL: 计数器下溢'; exit 1; }
+          grep -q 'bye. final alive=0' ar7s.log || { echo 'FAIL: final 异常'; tail -3 ar7s.log; exit 1; }
           echo 'AUDIT REGRESSION PASS'
 
       - name: TUI 冒烟(向导可进可退,非终端不误入)

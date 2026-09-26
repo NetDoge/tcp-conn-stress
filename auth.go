@@ -109,6 +109,31 @@ func clientAuth(conn net.Conn, pass string, t *target) error {
 	return nil
 }
 
+// lateAuthRecover 迟到 banner 的现场补握手(holdConn 调用):
+// clientAuth 因 5s 内未收到 banner 把 target 误判为 noAuth 后,真 banner
+// 到达时在这里补完握手。成功则撤销 noAuth(该 target 后续连接恢复正常
+// 握手路径),连接继续作为已建连保持;失败返回 false(密码不匹配等)。
+// 旧版此处直接 Fatal:驱逐风暴/高延迟下的瞬时 banner 超时被固化成
+// 永久误判,带正确密码的客户端整批自杀(实测 mock 延迟 7s → rc=1)。
+func lateAuthRecover(conn net.Conn, pass string, t *target) bool {
+	_ = conn.SetWriteDeadline(time.Now().Add(authClientTO))
+	_, werr := conn.Write([]byte(authPrefix + pass + "\n"))
+	_ = conn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		return false
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
+	resp, rerr := readAuthLine(conn)
+	_ = conn.SetReadDeadline(time.Time{}) // 清掉,继续无限期等断开
+	if rerr != nil || resp != authOK {
+		return false
+	}
+	if t.noAuth.CompareAndSwap(true, false) {
+		log.Printf("server %s banner 迟到,已补握手并撤销 noAuth 误判(网络延迟/服务端过载所致)", t.addr)
+	}
+	return true
+}
+
 // ---------------- 服务端侧(Go 实现;C 实现见 csrc/server.c) ----------------
 
 // serverAuth 服务端握手;通过返回 true(连接转正常)。

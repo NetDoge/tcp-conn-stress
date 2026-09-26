@@ -148,15 +148,20 @@ func runServer(ports []string, pass string) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					// 鉴权:通过才计数(失败连接不进 conns 表、不占统计)
+					// 先入 conns 表再鉴权:shutdown 的逐个 close 才能命中
+					// "鉴权中"的连接 —— 旧版它们卡在 10s 读 deadline 上,
+					// 退出恒烧满 5s 兜底(实测 SIGINT 后固定 5.0s 才 bye)
+					s.conns.Store(c, idx)
 					if pass != "" {
 						if !serverAuth(c, pass) {
-							s.authFail.Add(1)
+							if ctx.Err() == nil {
+								s.authFail.Add(1) // 退出期关闭不算鉴权失败
+							}
+							s.conns.Delete(c)
 							_ = c.Close()
 							return
 						}
 					}
-					s.conns.Store(c, idx)
 					s.alive.Add(1)
 					s.totalAcc.Add(1)
 					s.perPort[idx].Add(1)

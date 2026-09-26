@@ -52,7 +52,7 @@ func runServer(ports []string, pass string) error {
 	defer func() {
 		for _, a := range argv {
 			C.free(unsafe.Pointer(a))
-	}
+		}
 	}()
 
 	if pass != "" {
