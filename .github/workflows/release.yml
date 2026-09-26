@@ -102,7 +102,7 @@ jobs:
       - name: 编译
         run: |
           make CFLAGS='-O2 -s -Wall -Wextra -pthread' LDFLAGS='-pthread -static'
-          go build -o client .
+          CGO_ENABLED=0 go build -o client .
 
       - name: 参数校验
         run: |
