@@ -186,6 +186,7 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP,  &sa, NULL);   /* ssh 断开也走优雅退出,保住 final 统计 */
     signal(SIGPIPE, SIG_IGN);
 
     /* epoll */

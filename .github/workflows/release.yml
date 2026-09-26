@@ -1,7 +1,7 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.1
+#   1) 推 tag 触发:  git push origin v1.0.2
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
 # v1.0.1 起单一二进制 tcp-stress(-s 服务端 / -c 客户端):
@@ -15,7 +15,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.1'
+        default: 'v1.0.2'
 
 permissions:
   contents: read
@@ -110,6 +110,8 @@ jobs:
           ./tcp-stress -c -servers 127.0.0.1:1 -keepalive -1s 2>&1 | grep -q 'keepalive must be'
           ./tcp-stress -s 99999 2>&1 | grep -q 'invalid port'
           ./tcp-stress -s 2>&1 | grep -q '至少一个端口'
+          ./tcp-stress 8888 -c 2>&1 | grep -q '未指定模式'
+          ./tcp-stress -c -servers 127.0.0.1:1 -target 9223372036854775808 2>&1 | grep -q 'target too large'
 
       # 135s:故意跨过旧版 120s 读超时 bug 的阈值。
       # 旧版会在此时限内把健康连接全杀一轮(try 远超 target),
@@ -150,6 +152,21 @@ jobs:
           grep -q 'alive=0 |' s2.log      || { echo "FAIL: 服务端未感知断连"; exit 1; }
           grep -q 'total_close=50' s2.log || { echo "FAIL: total_close != 50"; exit 1; }
           kill -INT "$(cat srv2.pid)"
+
+      - name: SIGHUP 优雅退出测试
+        run: |
+          ./tcp-stress -s 18888 > s3.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress -c -servers 127.0.0.1:18888 -target 20 -rate 20 > c3.log 2>&1 &
+          CLI=$!
+          sleep 3
+          kill -HUP $CLI
+          sleep 2
+          grep -q 'final: try=20 ok=20' c3.log || { echo "FAIL: SIGHUP 未优雅退出"; exit 1; }
+          kill -HUP $SRV
+          sleep 1
+          grep -q 'bye. final alive' s3.log || { echo "FAIL: server SIGHUP 未优雅退出"; exit 1; }
           echo 'SMOKE PASS'
 
   release:

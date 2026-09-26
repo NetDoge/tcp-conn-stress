@@ -57,8 +57,15 @@ func main() {
 			os.Exit(1)
 		}
 	case clientMode:
+		if flag.NArg() > 0 {
+			fmt.Fprintf(os.Stderr, "error: 客户端模式不支持位置参数: %v\n", flag.Args())
+			os.Exit(2)
+		}
 		runClient(cfg)
 	default:
+		if flag.NArg() > 0 {
+			fmt.Fprintf(os.Stderr, "error: 未指定模式(-s/-c);模式参数必须写在最前面,收到的位置参数: %v\n", flag.Args())
+		}
 		flag.Usage()
 		os.Exit(2)
 	}

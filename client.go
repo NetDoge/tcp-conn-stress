@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -41,13 +42,13 @@ type clientConfig struct {
 type target struct {
 	ip   string
 	port int
+	addr string // net.JoinHostPort 结果,IPv6 自带方括号
 }
 
 type stats struct {
 	try    atomic.Uint64
 	ok     atomic.Uint64
 	active atomic.Int64
-	fail   atomic.Uint64
 	// 失败分类
 	failTO    atomic.Uint64 // i/o timeout
 	failRST   atomic.Uint64 // connection refused
@@ -76,7 +77,8 @@ func parseTargets(s string) ([]target, error) {
 		if _, err := fmt.Sscanf(port, "%d", &pn); err != nil || pn <= 0 || pn > 65535 {
 			return nil, fmt.Errorf("bad port in %q", p)
 		}
-		out = append(out, target{ip: host, port: pn})
+		out = append(out, target{ip: host, port: pn,
+			addr: net.JoinHostPort(host, fmt.Sprintf("%d", pn))})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no targets")
@@ -148,9 +150,8 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 	for off := 0; off < tlen; off++ {
 		idx := (startIdx + off) % tlen
 		t := targets[idx]
-		addr := fmt.Sprintf("%s:%d", t.ip, t.port)
 		st.try.Add(1)
-		conn, err := d.DialContext(ctx, "tcp", addr)
+		conn, err := d.DialContext(ctx, "tcp", t.addr)
 		if err != nil {
 			classifyErr(err)
 			if strings.Contains(err.Error(), "cannot assign requested address") {
@@ -220,6 +221,9 @@ func runClient(cfg clientConfig) {
 	if keepAlive > 10*time.Minute {
 		log.Fatalf("keepalive too long (max 10m)")
 	}
+	if target > math.MaxInt64 {
+		log.Fatalf("target too large (max %d)", uint64(math.MaxInt64))
+	}
 
 	targets, err := parseTargets(cfg.servers)
 	if err != nil {
@@ -227,7 +231,7 @@ func runClient(cfg clientConfig) {
 	}
 	log.Printf("targets:")
 	for _, t := range targets {
-		log.Printf("  - %s:%d", t.ip, t.port)
+		log.Printf("  - %s", t.addr)
 	}
 	if cfg.bind != "" {
 		log.Printf("bind local ip: %s", cfg.bind)
@@ -235,7 +239,8 @@ func runClient(cfg clientConfig) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// SIGHUP 一并优雅处理:ssh 断开时也能打完 final 统计再退
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigCh
 		log.Println("signal received, draining...")
@@ -321,8 +326,9 @@ func runClient(cfg clientConfig) {
 			case <-t.C:
 				curTry := st.try.Load()
 				curOk := st.ok.Load()
-				dt := curTry - lastTry
-				do := curOk - lastOk
+				// 换算每秒速率:-stats 非 1s 时 +/s 才是真实值
+				dt := uint64(math.Round(float64(curTry-lastTry) / statsInt.Seconds()))
+				do := uint64(math.Round(float64(curOk-lastOk) / statsInt.Seconds()))
 				lastTry, lastOk = curTry, curOk
 				log.Printf("[STAT] alive=%d try=%d ok=%d closed=%d | +try/s=%d +ok/s=%d | "+
 					"fail t/o=%d rst=%d addr-full=%d eof=%d other=%d",
