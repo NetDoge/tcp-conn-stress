@@ -1,12 +1,12 @@
 name: release
 
 # 云编译并在 Releases 发布:
-#   1) 推 tag 触发:  git push origin v1.0.4
+#   1) 推 tag 触发:  git push origin v1.0.5
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
-# v1.0.1 起单一二进制 tcp-stress(-s 服务端 / -c 客户端):
+# 单一二进制 tcp-stress(-s 服务端 / -c 客户端),全平台全功能:
 #   - Linux:  cgo 静态构建,C 服务端(epoll)编入,不挑 glibc
-#   - 其他平台: epoll 不可用,CGO_ENABLED=0 只含客户端,-s 明确报错
+#   - 其他平台: 纯 Go 服务端(server_go.go),行为与 C 版对齐
 on:
   push:
     tags: ['v*']
@@ -15,7 +15,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.4'
+        default: 'v1.0.5'
 
 permissions:
   contents: read
@@ -59,7 +59,7 @@ jobs:
               go build -trimpath -tags 'osusergo netgo' \
               -ldflags "-s -w -extldflags -static -X main.version=${V}" -o "tcp-stress${ext}" .
           else
-            # darwin/windows:epoll 不可用,服务端替换为 stub(server_stub.go),纯 Go
+            # darwin/windows:纯 Go 服务端(server_go.go),全功能
             CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
               go build -trimpath -ldflags "-s -w -X main.version=${V}" -o "tcp-stress${ext}" .
           fi
@@ -176,6 +176,24 @@ jobs:
           kill -HUP $SRV
           sleep 1
           grep -q 'bye. final alive' s3.log || { echo "FAIL: server SIGHUP 未优雅退出"; exit 1; }
+
+      - name: 纯 Go 服务端双模式测试(CGO_ENABLED=0 构建)
+        run: |
+          CGO_ENABLED=0 go build -o tcp-stress-go .
+          ./tcp-stress-go -s 18888 18889 > sg.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          ./tcp-stress-go -c -servers "127.0.0.1:18888,127.0.0.1:18889" \
+            -target 100 -rate 100 > cg.log 2>&1 &
+          CLI=$!
+          sleep 4
+          grep -q 'alive=100 |' sg.log || { echo "FAIL: Go 服务端计数异常"; exit 1; }
+          kill -9 $CLI
+          sleep 3
+          grep -q 'total_close=100' sg.log || { echo "FAIL: Go 服务端未回收断连"; exit 1; }
+          kill -INT $SRV
+          grep -q 'bye. final alive' sg.log || { echo "FAIL: Go 服务端退出异常"; exit 1; }
+          echo 'GO SERVER PASS'
 
       - name: fd 软上限自动抬升测试
         run: |

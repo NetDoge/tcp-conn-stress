@@ -55,17 +55,3 @@ func runServer(ports []string) error {
 	}
 	return nil
 }
-
-func isValidPort(s string) bool {
-	if s == "" || len(s) > 5 {
-		return false
-	}
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n >= 1 && n <= 65535
-}

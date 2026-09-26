@@ -4,8 +4,8 @@
 #   make dyn    动态构建(本机调试,编译快)
 #   make clean  清理
 #
-# 非 Linux 平台没有 epoll,服务端不参与编译(server_stub.go 接管),
-# 那边交叉编译用:
+# 非 Linux 平台(或未开 cgo)的服务端走 server_go.go 纯 Go 实现,同样全功能,
+# 交叉编译用:
 #   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress .
 
 BINARY  = tcp-stress

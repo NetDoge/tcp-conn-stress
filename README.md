@@ -1,9 +1,9 @@
 # 家用宽带极限 TCP 连接测试 (tcp-stress)
 
 测试家用宽带 / 路由器 / NAT 设备在不交换业务数据的前提下,能维持多少个并发 TCP 长连接。
-**v1.0.1 起合并为单二进制 `tcp-stress`**:
-- `-s` 服务器模式:C + epoll(cgo 内嵌),多端口监听,极致内存,仅 Linux
-- `-c` 客户端模式:纯 Go,token-bucket 限速,自动多端口轮询,全平台
+**单二进制 `tcp-stress`,全平台全功能**:
+- `-s` 服务器模式:Linux 用 C + epoll(cgo 内嵌,极致内存);macOS / Windows 用纯 Go 等效实现(行为对齐)
+- `-c` 客户端模式:纯 Go,token-bucket 限速,自动多端口轮询
 
 ```bash
 tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端)
@@ -21,7 +21,7 @@ tcp-stress -h                                # 帮助(-help 同义,exit 0)
 | `main.go` | 单二进制入口,`-s`/`-c` 模式分发与 flag 定义 |
 | `csrc/server.c` | C 服务端实现(多端口 epoll,KeepAlive 抗 NAT 老化) |
 | `server_linux.go` | cgo 桥:Linux 构建把 C 服务端编进二进制 |
-| `server_stub.go` | 非 Linux / 纯 Go 构建的服务端占位(`-s` 明确报错) |
+| `server_go.go` | 纯 Go 服务端实现(darwin / windows,行为与 C 版对齐) |
 | `client.go` | Go 客户端主逻辑,轮询打满多端口 |
 | `sockopt_unix.go` / `sockopt_windows.go` | 平台相关的底层 socket 调优(按 build tag 二选一) |
 | `Makefile` | 构建脚本(静态 cgo 构建) |
@@ -30,8 +30,8 @@ tcp-stress -h                                # 帮助(-help 同义,exit 0)
 
 > C 源码放 `csrc/` 子目录是刻意的:目录里直接有 `.c` 文件时,
 > `CGO_ENABLED=0 go build .` 会报 "C source files not allowed",
-> 所有纯 Go 构建(交叉编译 darwin/windows)都会炸。由 cgo 前导
-> `#include "csrc/server.c"` 引入,非 Linux 构建完全不碰它。
+> 所有纯 Go 构建都会炸。由 cgo 前导 `#include "csrc/server.c"` 引入,
+> 纯 Go 构建完全不碰它(服务端走 `server_go.go`)。
 
 ---
 
@@ -109,21 +109,24 @@ make            # 静态 cgo 构建,产物不挑 glibc,可直接拷到别的机�
 make dyn        # 动态构建,本机调试编译快
 ```
 
-需要 gcc + Go 1.19+。手动等价:
+需要 gcc + Go 1.23+。手动等价:
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -tags 'osusergo netgo' \
   -ldflags '-s -w -extldflags -static' -o tcp-stress .
 ```
 
-### 2.2 其他平台(仅客户端)
+### 2.2 其他平台 / 未装 gcc 的 Linux(纯 Go,全功能)
 
 ```bash
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags '-s -w' -o tcp-stress.exe .
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o tcp-stress     .
 ```
 
-epoll 是 Linux 独有,darwin / windows 的二进制不含服务端,`-s` 会明确报错。
+epoll 是 Linux 独有,这些构建的服务端走 `server_go.go`(纯 Go):
+STATS 格式 / 断连回收 / 优雅退出 / KeepAlive 参数与 C 版对齐,
+每连接一个 goroutine(约 8KB/连接),中小规模与功能使用无碍;
+**10w+ 大规模压测建议仍用 Linux C 服务端**(epoll + 极致内存)。
 
 ### 2.3 直接用 Release 里的预编译产物
 
@@ -133,9 +136,9 @@ epoll 是 Linux 独有,darwin / windows 的二进制不含服务端,`-s` 会明�
 | --- | --- | --- |
 | `tcp-conn-stress-linux-amd64.tar.gz` | `tcp-stress`(全功能) | x86_64 Linux |
 | `tcp-conn-stress-linux-arm64.tar.gz` | `tcp-stress`(全功能) | ARM64 Linux(树莓派等) |
-| `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(仅客户端) | Intel Mac |
-| `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(仅客户端) | Apple Silicon Mac |
-| `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(仅客户端) | Windows |
+| `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Intel Mac |
+| `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Apple Silicon Mac |
+| `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | Windows |
 | `SHA256SUMS.txt` | 校验和 | 全部 |
 
 想自己触发一次云编译,推个 tag 即可:
@@ -263,6 +266,13 @@ tcp-stress -c -bind 192.168.10.5 \
 - 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
 - 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
 - CI 含同款长测,每次发版自动跑
+
+2026-09-26 v1.0.5 全平台全功能:
+
+- 新增 `server_go.go`:纯 Go 服务端,darwin / windows(及未开 cgo 的 Linux)的 `-s` 可用
+- 行为与 C 版对齐:STATS 逐字同格式、kill -9 客户端 3s 内回收(total_close=100 实测)、SIGHUP/INT/TERM 优雅退出、KeepAlive 60/10/3、2K 小缓冲
+- 构建标签:`linux && cgo` → C/epoll;其余 → server_go.go;`isValidPort` 上移 main.go 共享
+- go.mod 1.19 → 1.23(net.KeepAliveConfig);CI smoke 增加纯 Go 服务端双模式断言
 
 2026-09-26 v1.0.4 零配置可用:
 

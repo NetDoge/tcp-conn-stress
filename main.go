@@ -20,6 +20,21 @@ import (
 // 版本号:构建时注入(make VERSION=v1.0.3,CI 从 tag 取),默认 dev
 var version = "dev"
 
+// isValidPort 纯数字 1-65535(两种服务端实现与入口校验共用)
+func isValidPort(s string) bool {
+	if s == "" || len(s) > 5 {
+		return false
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n >= 1 && n <= 65535
+}
+
 func main() {
 	// fd 软上限自动抬到硬上限:免掉"ulimit -n"部署步骤(普通权限,无需 root)
 	if soft, hard := raiseNofile(); soft > 0 {
@@ -38,7 +53,7 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "打印版本号并退出(同 -v)")
 	flag.BoolVar(&showHelp, "h", false, "打印帮助信息并退出")
 	flag.BoolVar(&showHelp, "help", false, "打印帮助信息并退出(同 -h)")
-	flag.BoolVar(&serverMode, "s", false, "服务器模式:位置参数为监听端口列表")
+	flag.BoolVar(&serverMode, "s", false, "服务器模式:位置参数为监听端口列表(全平台)")
 	flag.BoolVar(&clientMode, "c", false, "客户端模式")
 	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表,逗号分隔,格式 IP:Port")
 	flag.StringVar(&cfg.bind, "bind", "", "客户端:本地出口 IP(多 WAN/策略路由时指定)")
@@ -51,7 +66,7 @@ func main() {
 		fmt.Fprintf(w, `tcp-stress — 家用宽带极限 TCP 长连接压测(单二进制)
 
 用法:
-  tcp-stress -s <port1> [port2] ...          服务器模式(仅 Linux 构建)
+  tcp-stress -s <port1> [port2] ...          服务器模式(Linux 为 C/epoll,其余为纯 Go)
   tcp-stress -c [客户端参数...]               客户端模式
 
 示例:
