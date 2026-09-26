@@ -177,6 +177,7 @@ git tag v1.0.0 && git push origin v1.0.0
 - `SO_RCVBUF/SO_SNDBUF=2048`,10w 连接 fd 内存 ≈ `sizeof(struct file)` 内核侧 + 用户态接近 0
 - `SO_KEEPALIVE` + `TCP_KEEPIDLE=60 / KEEPINTVL=10 / KEEPCNT=3` → 客户端静默 60s 后开始探测,30s 内判定对端死,触发本端发 RST
   - 与运营商 NAT 老化(典型 120-300s)留出余量
+- 退出时遍历 `/proc/self/fd` 逐个 close 已建连 socket → 客户端收到 FIN 而非 RST,`active` 优雅归零
 
 ### 客户端(`client.go`)
 - `net.Dialer.Control` 走 `syscall.RawConn.Control(fd)` → 在内核 fd 上 `SetsockoptInt` 压缓冲区

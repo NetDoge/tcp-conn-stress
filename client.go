@@ -127,37 +127,32 @@ func isTimeoutErr(err error) bool {
 	return false
 }
 
-// 轮询 dial:成功 -> 维持到 ctx 结束或断线
-func worker(ctx context.Context, wg *sync.WaitGroup, targets []target, d *net.Dialer) {
-	defer wg.Done()
+// dialer 负责拨号一次;返回的 conn 已建立。
+// portIdx: 失败切到下一个 target 时使用;成功则由调用方持有。
+// 失败时返回 err;成功时返回 conn 与下一个要试的 portIdx。
+// 返回值用于在多端口之间轮询。
+func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer) (net.Conn, int) {
 	tlen := len(targets)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		// 轮询每个端口:某端口端口耗尽会换下一个
-		for i := 0; i < tlen; i++ {
-			t := targets[i]
-			addr := fmt.Sprintf("%s:%d", t.ip, t.port)
-			st.try.Add(1)
-			conn, err := d.DialContext(ctx, "tcp", addr)
-			if err != nil {
-				classifyErr(err)
-				// 端口耗尽时短暂 sleep,避免狂打日志/狂吃 CPU
-				if strings.Contains(err.Error(), "cannot assign requested address") {
-					time.Sleep(50 * time.Millisecond)
-				}
-				continue
+	for off := 0; off < tlen; off++ {
+		idx := (startIdx + off) % tlen
+		t := targets[idx]
+		addr := fmt.Sprintf("%s:%d", t.ip, t.port)
+		st.try.Add(1)
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			classifyErr(err)
+			if strings.Contains(err.Error(), "cannot assign requested address") {
+				// 端口耗尽,不要狂打;也跳过当前端口试下一个
+				time.Sleep(50 * time.Millisecond)
 			}
-			st.ok.Add(1)
-			st.active.Add(1)
-			// 维持连接:直到对端关或 ctx 取消
-			go holdConn(ctx, conn)
-			// 一次成功就换下一个 target,均衡各端口
+			continue
 		}
+		st.ok.Add(1)
+		st.active.Add(1)
+		return conn, (idx + 1) % tlen
 	}
+	// 全部失败:保持起点,下个 token 从同一位置再轮
+	return nil, startIdx
 }
 
 // holdConn 维持连接:不读不写,让 keepalive 兜底;检测断线时回收计数
@@ -200,6 +195,16 @@ func main() {
 	)
 	flag.Parse()
 
+	if *rate <= 0 {
+		log.Fatalf("rate must be > 0")
+	}
+	if *target == 0 {
+		log.Fatalf("target must be > 0")
+	}
+	if *statsInt <= 0 {
+		log.Fatalf("stats interval must be > 0")
+	}
+
 	targets, err := parseTargets(*servers)
 	if err != nil {
 		log.Fatal(err)
@@ -241,35 +246,48 @@ func main() {
 		}
 	}()
 
-	// 启动 worker 数 = rate,每个吃令牌后循环 dial
-	var wg sync.WaitGroup
+	// worker 数:与 rate 解耦。少点也不会拖慢,多了只是空转抢 token。
 	workerN := *rate
-	if workerN > 2000 {
-		workerN = 2000
+	if workerN > 256 {
+		workerN = 256
 	}
 	if workerN < 16 {
 		workerN = 16
 	}
 	log.Printf("workers=%d, rate=%d conn/s, target=%d", workerN, *rate, *target)
 
+	// hold 计数:每次成功 dial 起一个 holdConn goroutine,它在退出前 Done 一次。
+	// 主线程 hold.Wait() 等所有连接清理完再打 final。
+	var hold sync.WaitGroup
+
 	for i := 0; i < workerN; i++ {
-		wg.Add(1)
-		go func() {
+		hold.Add(1)
+		go func(startIdx int) {
+			defer hold.Done()
+			portIdx := startIdx
 			for {
 				select {
 				case <-ctx.Done():
-					wg.Done()
 					return
 				case <-tokens:
 					if st.active.Load() >= int64(*target) {
-						// 已达目标,不再加新连,只等 ctx 结束
+						// 已达目标,让出 CPU,等 ctx 结束
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
-					worker(ctx, &wg, targets, d)
+					conn, next := dialOnce(ctx, targets, portIdx, d)
+					portIdx = next
+					if conn == nil {
+						continue
+					}
+					hold.Add(1)
+					go func(c net.Conn) {
+						defer hold.Done()
+						holdConn(ctx, c)
+					}(conn)
 				}
 			}
-		}()
+		}(i % len(targets))
 	}
 
 	// 统计打印
@@ -296,6 +314,6 @@ func main() {
 		}
 	}()
 
-	wg.Wait()
+	hold.Wait()
 	log.Printf("final: try=%d ok=%d active=%d", st.try.Load(), st.ok.Load(), st.active.Load())
 }

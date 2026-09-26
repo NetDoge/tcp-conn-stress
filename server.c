@@ -32,6 +32,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 /* 默认缓冲区阈值 - 压到内核最小,只为维持连接 */
 #define DEFAULT_RCVBUF  2048
@@ -55,9 +57,6 @@ static uint16_t g_ports[MAX_LISTENERS];
 static volatile uint64_t g_total_alive   = 0; /* 当前活跃 */
 static volatile uint64_t g_total_acc     = 0; /* 累计接受 */
 static volatile uint64_t g_total_close   = 0; /* 累计关闭 */
-static volatile uint64_t g_last_accepts  = 0; /* 上一个 1s 窗口新增 */
-static volatile uint64_t g_last_closes   = 0; /* 上一个 1s 窗口断开 */
-
 static volatile int g_stop = 0;
 
 static void on_signal(int s) {
@@ -151,8 +150,6 @@ static void *stats_thread(void *arg) {
         fprintf(stderr, "\n");
         fflush(stderr);
 
-        g_last_accepts = acc_rate;
-        g_last_closes  = close_rate;
     }
     return NULL;
 }
@@ -241,6 +238,7 @@ int main(int argc, char **argv) {
                 if (cfd < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     if (errno == EINTR) continue;
+                    if (errno == ECONNABORTED || errno == ECONNRESET) continue;
                     perror("accept4");
                     break;
                 }
@@ -255,9 +253,28 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "shutting down...\n");
-    /* 关闭所有连接 */
-    /* 简化:遍历 /proc/self/fd 太重,直接关 listener,让内核回收已建连 */
+    /* 优雅关闭:
+     * 1) 先关 listener,epoll 再不会分发新的 accept 事件
+     * 2) 遍历 /proc/self/fd,把所有 socket 类型的 fd 都 close 掉(已 accept 的连接)
+     *    客户端会收到 FIN,而不是被内核强 RST
+     */
     for (int i = 0; i < g_port_count; i++) close(listeners[i]);
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            int fd = atoi(de->d_name);
+            if (fd <= 2) continue;          /* stdin/stdout/stderr */
+            if (fd == ep) continue;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+                close(fd);
+                /* 不用减 g_total_alive:这是退出路径,final alive 取关闭瞬间值即可 */
+            }
+        }
+        closedir(d);
+    }
     close(ep);
     fprintf(stderr, "bye. final alive=%lu\n", (unsigned long)g_total_alive);
     return 0;
