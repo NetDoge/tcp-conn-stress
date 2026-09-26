@@ -14,7 +14,7 @@ on:
         default: 'v1.0.0'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -89,8 +89,69 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: 编译
+        run: |
+          make CFLAGS='-O2 -s -Wall -Wextra -pthread' LDFLAGS='-pthread -static'
+          go build -o client .
+
+      - name: 参数校验
+        run: |
+          ./client -servers 127.0.0.1:1 -rate 50001 2>&1 | grep -q 'rate too large'
+          ./client -servers 127.0.0.1:1 -keepalive -1s 2>&1 | grep -q 'keepalive must be'
+
+      # 135s:故意跨过旧版 120s 读超时 bug 的阈值。
+      # 旧版会在此时限内把健康连接全杀一轮(try 远超 target),
+      # 这类"长跑才炸"的回归短冒烟测不出来,必须有长测兜底。
+      - name: 回环长测(135s,防误杀重拨回归)
+        run: |
+          ./server 18888 18889 > s.log 2>&1 &
+          echo $! > srv.pid
+          sleep 0.5
+          ./client -servers "127.0.0.1:18888,127.0.0.1:18889"                    -target 100 -rate 100 > c.log 2>&1 &
+          echo $! > cli.pid
+          sleep 135
+          kill -INT "$(cat cli.pid)"
+          sleep 3
+          echo '--- client log tail ---'; tail -5 c.log
+          max_try=$(grep -oE 'try=[0-9]+' c.log | cut -d= -f2 | sort -n | tail -1)
+          max_alive=$(grep -oE 'alive=[0-9]+' c.log | cut -d= -f2 | sort -n | tail -1)
+          closed=$(grep -oE 'closed=[0-9]+' c.log | cut -d= -f2 | sort -n | tail -1)
+          [ "$max_try" = "100" ]  || { echo "FAIL: try=$max_try != 100 (健康连接被误杀重拨)"; exit 1; }
+          [ "$max_alive" = "100" ] || { echo "FAIL: alive=$max_alive != 100"; exit 1; }
+          [ "$closed" = "0" ]     || { echo "FAIL: closed=$closed != 0"; exit 1; }
+          grep -q 'final: try=100 ok=100 closed=0' c.log || { echo "FAIL: final 行异常"; exit 1; }
+          kill -INT "$(cat srv.pid)"; sleep 1
+
+      - name: 服务端回收测试(kill -9 客户端)
+        run: |
+          ./server 18888 18889 > s2.log 2>&1 &
+          echo $! > srv2.pid
+          sleep 0.5
+          ./client -servers "127.0.0.1:18888,127.0.0.1:18889"                    -target 50 -rate 50 > c2.log 2>&1 &
+          CLI2=$!
+          sleep 4
+          kill -9 $CLI2
+          sleep 3
+          tail -3 s2.log
+          grep -q 'alive=0 |' s2.log      || { echo "FAIL: 服务端未感知断连"; exit 1; }
+          grep -q 'total_close=50' s2.log || { echo "FAIL: total_close != 50"; exit 1; }
+          kill -INT "$(cat srv2.pid)"
+          echo 'SMOKE PASS'
+
   release:
-    needs: build
+    needs: [build, smoke]
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v8

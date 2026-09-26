@@ -4,6 +4,7 @@
  * 特性:
  *   - 命令行接收多个监听端口,通过单个 epoll 实例统一管理
  *   - accept 后立即压低 RCVBUF/SNDBUF,10w+ 连接省内存
+ *   - 已建连 socket 也入 epoll(只盯 RDHUP/ERR/HUP),对端断开即回收
  *   - 启用 SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT,60s 抗 NAT 老化
  *   - 独立统计线程:每秒打印总数/分端口/每秒增/减
  *
@@ -47,6 +48,8 @@
 #define MAX_EVENTS 256
 /* 监听 fd 上限 */
 #define MAX_LISTENERS 64
+/* 连接 fd 的 epoll data 标记(bit63);监听 fd 的高 32 位是端口索引(<64),bit63 恒 0 */
+#define CONN_TAG ((uint64_t)1 << 63)
 
 /* 分端口计数 */
 static uint32_t g_per_port[MAX_LISTENERS];
@@ -58,6 +61,8 @@ static volatile uint64_t g_total_alive   = 0; /* 当前活跃 */
 static volatile uint64_t g_total_acc     = 0; /* 累计接受 */
 static volatile uint64_t g_total_close   = 0; /* 累计关闭 */
 static volatile int g_stop = 0;
+/* EMFILE 告警限频(每 10s 最多一条) */
+static time_t g_last_emfile_log = 0;
 
 static void on_signal(int s) {
     (void)s;
@@ -100,10 +105,6 @@ static int make_listener(uint16_t port) {
         return -1;
     }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-#ifdef SO_REUSEPORT
-    /* 允许同端口多实例;若只需 1 实例也不冲突 */
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
-#endif
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -212,8 +213,24 @@ int main(int argc, char **argv) {
 
     /* 主事件循环 */
     struct epoll_event events[MAX_EVENTS];
+    /* EMFILE 时按端口记录 listener 摘除截止时间 */
+    time_t pause_until[MAX_LISTENERS];
+    memset(pause_until, 0, sizeof(pause_until));
     fprintf(stderr, "server running, ctrl-c to stop.\n");
     while (!g_stop) {
+        /* 摘除的 listener 到时挂回 */
+        time_t now = time(NULL);
+        for (int j = 0; j < g_port_count; j++) {
+            if (pause_until[j] && now >= pause_until[j]) {
+                memset(&ev, 0, sizeof(ev));
+                ev.events = EPOLLIN;
+                ev.data.u64 = ((uint64_t)j << 32) | (uint32_t)listeners[j];
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, listeners[j], &ev) < 0)
+                    perror("epoll_ctl re-ADD listener");
+                pause_until[j] = 0;
+            }
+        }
+
         int n = epoll_wait(ep, events, MAX_EVENTS, 500);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -221,11 +238,24 @@ int main(int argc, char **argv) {
             break;
         }
         for (int i = 0; i < n; i++) {
-            int fd = (int)(events[i].data.u64 & 0xffffffff);
-            uint32_t port_idx = (uint32_t)(events[i].data.u64 >> 32);
+            uint64_t dat = events[i].data.u64;
+
+            if (dat & CONN_TAG) {
+                /* 已建连 socket:对端 FIN/RST 或 keepalive 判死 → 回收 */
+                int cfd = (int)(uint32_t)(dat & 0xffffffff);
+                uint32_t pidx = (uint32_t)((dat >> 32) & 0x7fffffff);
+                close(cfd); /* close 自动从 epoll 摘除 */
+                __sync_sub_and_fetch(&g_total_alive, 1);
+                __sync_add_and_fetch(&g_total_close, 1);
+                __sync_sub_and_fetch(&g_per_port[pidx], 1);
+                continue;
+            }
+
+            int fd = (int)(dat & 0xffffffff);
+            uint32_t port_idx = (uint32_t)(dat >> 32);
 
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                /* 监听 fd 出错 - 罕见;尝试重建 */
+                /* 监听 fd 出错 - 罕见 */
                 fprintf(stderr, "listener fd=%d err/hup\n", fd);
                 continue;
             }
@@ -239,15 +269,35 @@ int main(int argc, char **argv) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     if (errno == EINTR) continue;
                     if (errno == ECONNABORTED || errno == ECONNRESET) continue;
+                    if (errno == EMFILE || errno == ENFILE) {
+                        /* fd 耗尽:必须摘下 listener,
+                         * 否则电平触发空转烧 CPU + 刷爆日志 */
+                        epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+                        pause_until[port_idx] = time(NULL) + 1;
+                        if (time(NULL) - g_last_emfile_log >= 10) {
+                            g_last_emfile_log = time(NULL);
+                            fprintf(stderr, "accept4: %s - fd exhausted, "
+                                    "listener %u paused 1s\n",
+                                    strerror(errno), g_ports[port_idx]);
+                        }
+                        break;
+                    }
                     perror("accept4");
                     break;
                 }
                 tune_socket(cfd);
-                g_per_port[port_idx]++;
+                /* 连接 fd 挂 epoll:只盯断开/错误,不监听 EPOLLIN(不收数据) */
+                memset(&ev, 0, sizeof(ev));
+                ev.events = EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                ev.data.u64 = CONN_TAG | ((uint64_t)port_idx << 32) | (uint32_t)cfd;
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+                    perror("epoll_ctl ADD conn");
+                    close(cfd);
+                    continue;
+                }
+                __sync_add_and_fetch(&g_per_port[port_idx], 1);
                 __sync_add_and_fetch(&g_total_alive, 1);
                 __sync_add_and_fetch(&g_total_acc, 1);
-                /* 不读不写,fd 自动随 keepalive 检测存活 */
-                /* 也不加入 epoll - 无数据交互,无意义 */
             }
         }
     }

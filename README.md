@@ -49,8 +49,9 @@ sysctl -w net.ipv4.ip_local_port_range='1024 65535'
 # 6) conntrack 表(路由器/网关或开了 NAT 的机器需要)
 #    实测 10w 连接至少给 30w,留 3x 余量
 sysctl -w net.netfilter.nf_conntrack_max=524288
-# 已分配的 conntrack 哈希表大小(老内核才需要)
-sysctl -w net.netfilter.nf_conntrack_buckets=131072
+# 注意:nf_conntrack_buckets 是只读 sysctl,运行时改不了,只能模块加载时设
+#   echo 'options nf_conntrack hashsize=131072' | sudo tee /etc/modprobe.d/nf_conntrack.conf
+# (改完需重启;只调 max 不调 hashsize 也能跑,只是哈希偏挤)
 ```
 
 > 重启后 `sysctl.conf` / `limits.conf` 自动生效;已开 ssh 的会话用 `ulimit -n 1048576` 立即抬升。
@@ -158,13 +159,14 @@ git tag v1.0.0 && git push origin v1.0.0
 
 客户端每秒打印:
 ```
-[STAT] alive=14613 try=14613 ok=14613 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 eof=0 other=0
+[STAT] alive=14613 try=14613 ok=14613 closed=0 | +try/s=95 +ok/s=95 | fail t/o=0 rst=0 addr-full=0 eof=0 other=0
 ```
 
 **关注:**
 - `+try/s` ≈ `+ok/s`:网络通畅
 - `addr-full` 持续涨 → **客户端端口耗尽**,加端口或加网卡
 - `t/o` 持续涨 → **光猫/NAT 老化或对端丢包**,调大客户端 `-keepalive`
+- `closed` 持续涨(自己没在退出)→ **中间设备在拔连接** — 这就是要测的"家用宽带极限"
 - 服务端 `alive` 稳态不增 → 客户端打到目标值或被 QoS 限速
 
 ---
@@ -173,7 +175,8 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ### 服务端(`server.c`)
 - 一个 `epoll_create1` 实例管理**所有**监听 fd,`accept4` 一次性 accept loop 到 `EAGAIN`
-- `accept4(SOCK_NONBLOCK)` 后**不挂回 epoll** — 只 hold 连接、不收发,epoll 无意义
+- 已建连 socket 也注册进同一个 epoll(只盯 `EPOLLRDHUP/EPOLLERR/EPOLLHUP`,不收数据)→ 对端断开即回收,`alive`/`total_close`/分端口计数都是真值
+- `accept4` 遇 `EMFILE/ENFILE`:摘下 listener 1s 再挂回 + 10s 限频日志,fd 耗尽不空转
 - `SO_RCVBUF/SO_SNDBUF=2048`,10w 连接 fd 内存 ≈ `sizeof(struct file)` 内核侧 + 用户态接近 0
 - `SO_KEEPALIVE` + `TCP_KEEPIDLE=60 / KEEPINTVL=10 / KEEPCNT=3` → 客户端静默 60s 后开始探测,30s 内判定对端死,触发本端发 RST
   - 与运营商 NAT 老化(典型 120-300s)留出余量
@@ -185,6 +188,8 @@ git tag v1.0.0 && git push origin v1.0.0
 - 令牌桶:每秒按 `-rate` 注入令牌,worker 抢令牌去 `DialContext`
 - 失败分类:`timeout` / `refused` / `cannot assign requested address`(端口耗尽)/ `EOF` / 其他
 - 端口耗尽会**自动切下一个 target**,不卡死
+- `holdConn` **不设读 deadline**:对端不发数据,deadline 只会把健康连接误杀(历史 bug:每条连接活不过 120s,全体旋转木马重拨);死链交 keepalive 内核探测感知
+- `closed` 计数:维持期间被断开的连接 — 真实 NAT 老化的直接观测指标
 
 ---
 
@@ -193,3 +198,11 @@ git tag v1.0.0 && git push origin v1.0.0
 - 容器内回环:单端口 18888,2 秒内 accept **9315/s**,峰值活跃 **14613**。
 - 验证 `epoll` + `accept4` 主循环 + keepalive + 统计线程均工作正常。
 - 容器 ulimit 524288、内核无 conntrack 限制。
+
+2026-09-26 审计轮(修复后复验):
+
+- 165s 长测(跨过旧 120s bug 阈值):`try=300 = target`,零重拨 — 旧版同场景 `try=600`
+- `kill -9` 客户端:服务端 3s 内 `alive=0`、`total_close=200`、分端口全归零
+- 同端口双实例:第二实例 `Address already in use` 拒绝(移除 `SO_REUSEPORT`)
+- 参数校验:`-rate 50001` / `-keepalive -1s` 均拒绝
+- CI 含同款长测,每次发版自动跑

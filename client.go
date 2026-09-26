@@ -1,6 +1,6 @@
 // client.go - 家用宽带极限 TCP 连接测试客户端
 //
-// 编译:  go build -o client client.go
+// 编译:  go build -o client .
 // 运行:  ./client -servers "192.168.1.100:8888,192.168.1.100:8889" \
 //                 -target 100000 -rate 200
 //
@@ -8,7 +8,7 @@
 //   - 多端口轮询,每端口打到内核临时端口上限时切下一个
 //   - 自定义 net.Dialer:KeepAlive 30s + 小读写缓冲
 //   - 令牌桶限速,默认 200 conn/s,可调
-//   - 实时统计:尝试/成功/活跃/失败 类别分布
+//   - 实时统计:尝试/成功/活跃/断开/失败 类别分布
 
 package main
 
@@ -34,16 +34,18 @@ type target struct {
 }
 
 type stats struct {
-	try      atomic.Uint64
-	ok       atomic.Uint64
-	active   atomic.Int64
-	fail     atomic.Uint64
+	try    atomic.Uint64
+	ok     atomic.Uint64
+	active atomic.Int64
+	fail   atomic.Uint64
 	// 失败分类
-	failTO   atomic.Uint64 // i/o timeout
-	failRST  atomic.Uint64 // connection refused
-	failAddr atomic.Uint64 // cannot assign requested address (端口耗尽)
-	failEOF  atomic.Uint64 // EOF
+	failTO    atomic.Uint64 // i/o timeout
+	failRST   atomic.Uint64 // connection refused
+	failAddr  atomic.Uint64 // cannot assign requested address (端口耗尽)
+	failEOF   atomic.Uint64 // EOF
 	failOther atomic.Uint64
+	// 维持期间被断开(对端关/链路死):观察 NAT 老化的关键指标
+	closed atomic.Uint64
 }
 
 var st stats
@@ -155,43 +157,45 @@ func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer
 	return nil, startIdx
 }
 
-// holdConn 维持连接:不读不写,让 keepalive 兜底;检测断线时回收计数
+// holdConn 维持连接:不收发数据,阻塞等待断开或 ctx 取消。
+// 断开感知的三个出口:
+//  1. 对端 FIN/RST → Read 返回 EOF / reset
+//  2. 对端死透(NAT 老化拔线) → keepalive 探测失败,内核报 ETIMEDOUT
+//  3. ctx 取消 → defer Close() 解除阻塞的 Read
+//
+// 注意:绝不设读 deadline —— 对端本就不发数据,deadline 只会把
+// 健康连接当死链掐掉(历史 bug:每条连接活不过 120s,全体旋转木马)。
 func holdConn(ctx context.Context, conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 		st.active.Add(-1)
 	}()
-	// 设读超时,以便尽快感知对端断
-	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	buf := make([]byte, 64)
 	done := make(chan struct{})
 	go func() {
-		for {
-			_, err := conn.Read(buf)
-			if err != nil {
-				close(done)
-				return
-			}
-			// 拉长读超时,避免 keepalive 周期内被自己掐掉
-			_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		}
+		_, _ = conn.Read(buf)
+		close(done)
 	}()
 	select {
 	case <-ctx.Done():
 		return
 	case <-done:
+		// ctx 取消引发的 Close 也会让 Read 出错;那不算失败
+		if ctx.Err() == nil {
+			st.closed.Add(1)
+		}
 		return
 	}
 }
 
 func main() {
 	var (
-		servers  = flag.String("servers", "127.0.0.1:8888", "目标地址列表,逗号分隔,格式 IP:Port")
-		bind     = flag.String("bind", "", "本地出口 IP(多 WAN/策略路由时指定)")
-		target   = flag.Uint64("target", 10000, "目标总连接数(到达后保持)")
-		rate     = flag.Int("rate", 200, "每秒建连速率上限")
+		servers   = flag.String("servers", "127.0.0.1:8888", "目标地址列表,逗号分隔,格式 IP:Port")
+		bind      = flag.String("bind", "", "本地出口 IP(多 WAN/策略路由时指定)")
+		target    = flag.Uint64("target", 10000, "目标总连接数(到达后保持)")
+		rate      = flag.Int("rate", 200, "每秒建连速率上限")
 		keepAlive = flag.Duration("keepalive", 30*time.Second, "TCP KeepAlive 间隔")
-		statsInt = flag.Duration("stats", 1*time.Second, "统计打印周期")
+		statsInt  = flag.Duration("stats", 1*time.Second, "统计打印周期")
 	)
 	flag.Parse()
 
@@ -203,6 +207,15 @@ func main() {
 	}
 	if *statsInt <= 0 {
 		log.Fatalf("stats interval must be > 0")
+	}
+	if *rate > 50000 {
+		log.Fatalf("rate too large (max 50000)")
+	}
+	if *keepAlive < 0 {
+		log.Fatalf("keepalive must be >= 0 (0 = Go default 15s)")
+	}
+	if *keepAlive > 10*time.Minute {
+		log.Fatalf("keepalive too long (max 10m)")
 	}
 
 	targets, err := parseTargets(*servers)
@@ -270,6 +283,9 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-tokens:
+					if ctx.Err() != nil {
+						return
+					}
 					if st.active.Load() >= int64(*target) {
 						// 已达目标,让出 CPU,等 ctx 结束
 						time.Sleep(100 * time.Millisecond)
@@ -305,9 +321,9 @@ func main() {
 				dt := curTry - lastTry
 				do := curOk - lastOk
 				lastTry, lastOk = curTry, curOk
-				log.Printf("[STAT] alive=%d try=%d ok=%d | +try/s=%d +ok/s=%d | "+
+				log.Printf("[STAT] alive=%d try=%d ok=%d closed=%d | +try/s=%d +ok/s=%d | "+
 					"fail t/o=%d rst=%d addr-full=%d eof=%d other=%d",
-					st.active.Load(), curTry, curOk, dt, do,
+					st.active.Load(), curTry, curOk, st.closed.Load(), dt, do,
 					st.failTO.Load(), st.failRST.Load(), st.failAddr.Load(),
 					st.failEOF.Load(), st.failOther.Load())
 			}
@@ -315,5 +331,6 @@ func main() {
 	}()
 
 	hold.Wait()
-	log.Printf("final: try=%d ok=%d active=%d", st.try.Load(), st.ok.Load(), st.active.Load())
+	log.Printf("final: try=%d ok=%d closed=%d active=%d",
+		st.try.Load(), st.ok.Load(), st.closed.Load(), st.active.Load())
 }
