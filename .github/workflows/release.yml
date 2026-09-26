@@ -252,8 +252,10 @@ jobs:
           printf 'q\n' | script -qec "./tcp-stress" /dev/null > tui1.log 2>&1
           grep -q '压测向导' tui1.log || { echo 'FAIL: TUI 未进入'; exit 1; }
           # 管道/重定向:usage exit 2,不挂住
-          ./tcp-stress < /dev/null > tui2.log 2>&1
-          [ $? -eq 2 ] || { echo 'FAIL: 非终端裸调用应 exit 2'; exit 1; }
+          # 注意 bash -e:命令预期非零,必须用 || 捕获,不能裸跑
+          rc=0
+          ./tcp-stress < /dev/null > tui2.log 2>&1 || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: 非终端裸调用应 exit 2,实际 $rc"; exit 1; }
           echo 'TUI SMOKE PASS'
 
       - name: armv7l 交叉构建检查
