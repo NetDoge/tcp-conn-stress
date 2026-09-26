@@ -11,8 +11,11 @@
 | 文件 | 说明 |
 | --- | --- |
 | `server.c` | 多端口 epoll 服务端,KeepAlive 抗 NAT 老化 |
-| `Makefile` | C 端编译脚本 |
-| `client.go` | Go 客户端,轮询打满多端口 |
+| `Makefile` | C 端编译脚本(默认静态链接) |
+| `client.go` | Go 客户端主逻辑,轮询打满多端口 |
+| `sockopt_unix.go` / `sockopt_windows.go` | 平台相关的底层 socket 调优(按 build tag 二选一) |
+| `go.mod` | Go module 定义 |
+| `.github/workflows/release.yml` | 云编译 + 自动发 Release |
 
 ---
 
@@ -73,11 +76,40 @@ make              # gcc -O2 -Wall -pthread
 ### 2.2 Go 客户端
 
 ```bash
-go build -o client client.go
-./client -h                     # 看参数
+go build -o client .        # 在项目目录内编译
 ```
 
-需要 Go 1.18+(`sync/atomic.Uint64`)。
+> 注意是 `go build -o client .`,**不要**写 `go build client.go`。
+> 目录里 `sockopt_unix.go` / `sockopt_windows.go` 按平台二选一参与编译,
+> 只指定 `client.go` 会缺 `setSmallBuf` 符号。
+
+需要 Go 1.19+(用到 `sync/atomic.Uint64`)。
+
+交叉编译到其他平台(客户端与服务端不同,服务端只能在 Linux 跑):
+
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o client.exe .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o client     .
+```
+
+### 2.3 直接用 Release 里的预编译产物
+
+每次打 tag 会由 GitHub Actions 云编译并发布到 Releases,无需本地工具链:
+
+| 产物 | 内容 | 适用 |
+| --- | --- | --- |
+| `tcp-conn-stress-linux-amd64.tar.gz` | `server` + `client` | x86_64 Linux |
+| `tcp-conn-stress-linux-arm64.tar.gz` | `server` + `client` | ARM64 Linux(树莓派等) |
+| `tcp-conn-stress-darwin-amd64.tar.gz` | `client` | Intel Mac |
+| `tcp-conn-stress-darwin-arm64.tar.gz` | `client` | Apple Silicon Mac |
+| `tcp-conn-stress-windows-amd64.zip` | `client.exe` | Windows |
+| `SHA256SUMS.txt` | 校验和 | 全部 |
+
+想自己触发一次云编译,推个 tag 即可:
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
 
 ---
 

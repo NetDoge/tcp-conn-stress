@@ -1,0 +1,110 @@
+name: release
+
+# 云编译并在 Releases 发布:
+#   1) 推 tag 触发:  git push origin v1.0.0
+#   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号(tag),如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 服务端依赖 epoll,只发 Linux;客户端全平台
+          - { name: linux-amd64,   goos: linux,   goarch: amd64, cc: gcc,                   apt: '',                     server: true }
+          - { name: linux-arm64,   goos: linux,   goarch: arm64, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu,  server: true }
+          - { name: darwin-amd64,  goos: darwin,  goarch: amd64, server: false }
+          - { name: darwin-arm64,  goos: darwin,  goarch: arm64, server: false }
+          - { name: windows-amd64, goos: windows, goarch: amd64, server: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装交叉 C 编译器
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: 编译服务端 (C, 静态)
+        if: matrix.server
+        run: |
+          make CC='${{ matrix.cc }}' \
+               CFLAGS='-O2 -s -Wall -Wextra -pthread' \
+               LDFLAGS='-pthread -static'
+
+      - name: 编译客户端 (Go)
+        run: |
+          ext=''
+          if [ '${{ matrix.goos }}' = 'windows' ]; then ext='.exe'; fi
+          CGO_ENABLED=0 GOOS='${{ matrix.goos }}' GOARCH='${{ matrix.goarch }}' \
+            go build -trimpath -ldflags '-s -w' -o "client${ext}" .
+
+      - name: 校验产物架构
+        run: |
+          ls -lh
+          if [ '${{ matrix.goos }}' = 'linux' ]; then
+            readelf -h server client | grep -E 'Class|Machine'
+          else
+            file client* 2>/dev/null || true
+          fi
+
+      - name: 打包
+        run: |
+          mkdir -p out
+          V='${{ matrix.name }}'
+          if [ -f server ]; then
+            tar -czf "out/tcp-conn-stress-${V}.tar.gz" server client README.md
+          elif [ -f client.exe ]; then
+            zip -q "out/tcp-conn-stress-${V}.zip" client.exe README.md
+          else
+            tar -czf "out/tcp-conn-stress-${V}.tar.gz" client README.md
+          fi
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd dist
+          ls -lh
+          sha256sum tcp-conn-stress-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: ${{ github.event.inputs.version || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false

@@ -75,11 +75,7 @@ func parseTargets(s string) ([]target, error) {
 // 自定义 socket:小缓冲 + keepalive
 func dialControl(network, addr string, c syscall.RawConn) error {
 	return c.Control(func(fd uintptr) {
-		// 2K 读写缓冲,极致省内存
-		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 2048)
-		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 2048)
-		// 关闭 Nagle (我们不发数据,关掉免得延迟任何将来的小包)
-		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		setSmallBuf(fd)
 	})
 }
 
