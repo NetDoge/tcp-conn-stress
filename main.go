@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -36,6 +37,55 @@ func isValidPort(s string) bool {
 		n = n*10 + int(c-'0')
 	}
 	return n >= 1 && n <= 65535
+}
+
+// parsePortSpec 展开端口说明串(空格分隔,单端口或 a-b 闭区间)为端口列表。
+// 只接受纯数字与 '-' 范围符;单端口 1-65535,范围须 a<=b 且 a>=1 b<=65535,
+// 且不得超出 64 个(与服务端监听上限一致,客户端同样套用)。
+// 返回 (list, err):list 为展开后的端口字符串;err 非空时 list 为空。
+// 空输入(全空白)返回空 list,nil —— 由调用方决定是否报错。
+func parsePortSpec(spec string) ([]string, error) {
+	fields := strings.Fields(spec)
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	if len(fields) > 64 {
+		return nil, fmt.Errorf("端口段太多(空格分隔,最多 64 段): %d", len(fields))
+	}
+	var out []string
+	for _, f := range fields {
+		lo, hi := f, f
+		if i := strings.IndexByte(f, '-'); i >= 0 {
+			lo, hi = f[:i], f[i+1:]
+			if lo == "" || hi == "" {
+				return nil, fmt.Errorf("端口范围格式错误: %q(应为 a-b,如 8888-8895)", f)
+			}
+			a, ea := strconv.Atoi(lo)
+			b, eb := strconv.Atoi(hi)
+			if ea != nil || eb != nil || a <= 0 || a > 65535 || b <= 0 || b > 65535 {
+				return nil, fmt.Errorf("非法端口: %q", f)
+			}
+			if a > b {
+				return nil, fmt.Errorf("端口范围起始大于结束: %q", f)
+			}
+			if len(out)+(b-a+1) > 64 {
+				return nil, fmt.Errorf("端口总数超出上限 64")
+			}
+			for p := a; p <= b; p++ {
+				out = append(out, strconv.Itoa(p))
+			}
+			continue
+		}
+		// 单端口
+		if !isValidPort(f) {
+			return nil, fmt.Errorf("非法端口: %q", f)
+		}
+		if len(out)+1 > 64 {
+			return nil, fmt.Errorf("端口总数超出上限 64")
+		}
+		out = append(out, f)
+	}
+	return out, nil
 }
 
 func main() {
@@ -150,7 +200,17 @@ func main() {
 			os.Exit(2)
 		}
 		if serverMode {
-			if err := runServer(flag.Args(), pass); err != nil {
+			// 位置参数支持端口范围(如 "8888-8895"):展开成单个端口列表再交给 runServer
+			ports, perr := parsePortSpec(strings.Join(flag.Args(), " "))
+			if perr != nil {
+				fmt.Fprintln(os.Stderr, "error:", perr)
+				os.Exit(2)
+			}
+			if len(ports) == 0 {
+				fmt.Fprintln(os.Stderr, "error: 服务器模式需要至少一个端口: tcp-stress -s <port1> [port2] ...")
+				os.Exit(2)
+			}
+			if err := runServer(ports, pass); err != nil {
 				fmt.Fprintln(os.Stderr, "error:", err)
 				os.Exit(1)
 			}

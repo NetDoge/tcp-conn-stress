@@ -10,7 +10,7 @@
 
 ```bash
 tcp-stress                                    # 终端里裸运行,进入交互向导
-tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端)
+tcp-stress -s 8888 8889 8890                # 服务器(受测线路那端);也支持范围如 -s 8888-8890
 tcp-stress -s -pass 秘密 8888 8890            # 带鉴权的服务端
 tcp-stress -c -servers "1.2.3.4:8888,1.2.3.4:8889" -target 100000 -rate 200
 tcp-stress -c -servers "1.2.3.4:8888" -pass 秘密 -target 10000    # 客户端带密码
@@ -201,6 +201,14 @@ tcp-stress -s 18888 18889 18890 18891
 tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18889,127.0.0.1:18890,127.0.0.1:18891" \
                  -target 50000 -rate 400 -stats 1s
 ```
+
+> **端口范围(v1.2.0)**:服务端位置参数与客户端 `-servers` 都支持 `a-b` 闭区间，
+> 展开后与服务端`-s`/客户端 target 共用 64 个上限。上面的写法可简写为:
+>
+> ```bash
+> tcp-stress -s 18888-18891
+> tcp-stress -c -servers "127.0.0.1:18888-18891" -target 50000 -rate 400 -stats 1s
+> ```
 
 ### 3.2 跨机器测家用宽带(典型用法)
 

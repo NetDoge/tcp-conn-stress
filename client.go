@@ -92,13 +92,26 @@ func parseTargets(s string) ([]target, error) {
 		if host == "" || host == "::" {
 			return nil, fmt.Errorf("bad target %q: 空 host,请写具体地址(如 127.0.0.1:8888 或 [::1]:8888)", p)
 		}
-		// 回环校验拒绝尾部垃圾与前导零/正负号("8888x"/"0080"/"+80"),
-		// 与服务端 isValidPort 同等严格(旧版 fmt.Sscanf 不查尾部,静默拨错端口)
-		pn, err := strconv.Atoi(port)
-		if err != nil || pn <= 0 || pn > 65535 || strconv.Itoa(pn) != port {
+		// 端口支持范围(如 ":8888-8895" 或 "[::1]:18800-18808"):展开成多个 target;
+		// 单端口时回环校验拒绝尾部垃圾与前导零/正负号("8888x"/"0080"/"+80"),
+		// 与服务端同语义(旧版 fmt.Sscanf 不查尾部,静默拨错端口)
+		lo, hi := port, port
+		if i := strings.IndexByte(port, '-'); i >= 0 {
+			lo, hi = port[:i], port[i+1:]
+			if lo == "" || hi == "" {
+				return nil, fmt.Errorf("bad port range in %q", p)
+			}
+		}
+		pa, ea := strconv.Atoi(lo)
+		pb, eb := strconv.Atoi(hi)
+		if ea != nil || eb != nil || pa <= 0 || pa > 65535 || pb <= 0 || pb > 65535 ||
+			pa > pb || strconv.Itoa(pa) != lo || strconv.Itoa(pb) != hi {
 			return nil, fmt.Errorf("bad port in %q", p)
 		}
-		out = append(out, target{ip: host, port: pn, addr: net.JoinHostPort(host, port)})
+		for q := pa; q <= pb; q++ {
+			ps := strconv.Itoa(q)
+			out = append(out, target{ip: host, port: q, addr: net.JoinHostPort(host, ps)})
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no targets")

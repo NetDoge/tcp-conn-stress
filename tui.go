@@ -52,19 +52,17 @@ func askInt(r *bufio.Reader, prompt string, def int64) int64 {
 
 func askPorts(r *bufio.Reader) []string {
 	for {
-		s := ask(r, "监听端口(空格分隔,1-65535,最多 64 个)", "8888 8889")
-		fields := strings.Fields(s)
-		ok := len(fields) > 0 && len(fields) <= 64
-		for _, p := range fields {
-			if !isValidPort(p) {
-				ok = false
-				break
-			}
+		s := ask(r, "监听端口(空格分隔,1-65535,最多 64 个;支持范围如 8888-8895)", "8888 8889")
+		ports, err := parsePortSpec(s)
+		if err != nil {
+			fmt.Printf("  %v,重新输入\n", err)
+			continue
 		}
-		if ok {
-			return fields
+		if len(ports) == 0 {
+			fmt.Println("  至少需要一个端口,重新输入")
+			continue
 		}
-		fmt.Println("  端口格式不对(纯数字 1-65535),重新输入")
+		return ports
 	}
 }
 
@@ -134,7 +132,7 @@ func runTUI() {
 		case "2":
 			var servers, bind string
 			for {
-				s := ask(r, "服务器地址列表(须为 tcp-stress 服务端,IP:Port 逗号分隔,最多 64 个)", "127.0.0.1:8888")
+				s := ask(r, "服务器地址列表(须为 tcp-stress 服务端,IP:Port 逗号分隔,最多 64 个;端口支持范围如 127.0.0.1:18888-18895)", "127.0.0.1:8888")
 				if _, err := parseTargets(s); err == nil {
 					servers = s
 					break
