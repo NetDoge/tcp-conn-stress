@@ -63,7 +63,7 @@ func parsePortSpec(spec string) ([]string, error) {
 			a, ea := strconv.Atoi(lo)
 			b, eb := strconv.Atoi(hi)
 			if ea != nil || eb != nil || a <= 0 || a > 65535 || b <= 0 || b > 65535 {
-				return nil, fmt.Errorf("非法端口: %q", f)
+				return nil, fmt.Errorf("invalid port: %s", f)
 			}
 			if a > b {
 				return nil, fmt.Errorf("端口范围起始大于结束: %q", f)
@@ -78,7 +78,7 @@ func parsePortSpec(spec string) ([]string, error) {
 		}
 		// 单端口
 		if !isValidPort(f) {
-			return nil, fmt.Errorf("非法端口: %q", f)
+			return nil, fmt.Errorf("invalid port: %s", f)
 		}
 		if len(out)+1 > 64 {
 			return nil, fmt.Errorf("端口总数超出上限 64")
