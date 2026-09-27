@@ -4,6 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
+# v1.1.1:第四轮审计修复(-stats 下限/纯 Go 前导零端口/passfile 权限警告/README 示例对齐)
 # v1.1.0:防滥用改造(服务端身份握手 STRESS/AUTH? + 客户端拒连第三方 + targets≤64 + README 使用政策)
 # v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
 # v1.0.8:复审修复(驱逐陈旧事件下溢/驱逐风暴 CPU/banner 迟到自愈/passfile 限读/Go 服务端退出)
@@ -20,7 +21,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.1.0'
+        default: 'v1.1.1'
 
 permissions:
   contents: read
@@ -139,6 +140,11 @@ jobs:
           ./tcp-stress -c -servers 127.0.0.1:1 -target 9223372036854775808 2>&1 | grep -q 'target too large'
           ./tcp-stress -c -servers ':1' -rate 1 2>&1 | grep -q '空 host'
           ./tcp-stress -c -servers '[::]:1' -rate 1 2>&1 | grep -q '空 host'
+          ./tcp-stress -c -servers 127.0.0.1:1 -stats 50ms 2>&1 | grep -q 'stats interval too small'
+          echo pw > /tmp/pf644; chmod 644 /tmp/pf644
+          ./tcp-stress -s -passfile /tmp/pf644 18888 > /tmp/pfw.log 2>&1 & PFW=$!
+          sleep 0.6; kill -INT $PFW 2>/dev/null || true; sleep 0.3
+          grep -q '建议 chmod 600' /tmp/pfw.log || { echo 'FAIL: -passfile 644 未警告'; exit 1; }
           ./tcp-stress -v    | grep -q '^tcp-stress ci-smoke (linux/amd64)'
           ./tcp-stress --version | grep -q 'ci-smoke'
           ./tcp-stress -h    | grep -q '家用宽带'
@@ -203,6 +209,8 @@ jobs:
       - name: 纯 Go 服务端双模式测试(CGO_ENABLED=0 构建)
         run: |
           CGO_ENABLED=0 go build -o tcp-stress-go .
+          ./tcp-stress-go -s 08080 2>&1 | grep -q 'invalid port' \
+            || { echo 'FAIL: 纯 Go 版前导零端口未拒绝'; exit 1; }
           ./tcp-stress-go -s 18888 18889 > sg.log 2>&1 &
           SRV=$!
           sleep 0.5

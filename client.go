@@ -267,8 +267,8 @@ func runClient(cfg clientConfig) {
 	if targetN == 0 {
 		log.Fatalf("target must be > 0")
 	}
-	if statsInt <= 0 {
-		log.Fatalf("stats interval must be > 0")
+	if statsInt < 100*time.Millisecond {
+		log.Fatalf("stats interval too small (min 100ms)")
 	}
 	if rate > 50000 {
 		log.Fatalf("rate too large (max 50000)")

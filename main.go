@@ -67,7 +67,7 @@ func main() {
 	flag.Uint64Var(&cfg.target, "target", 10000, "客户端:目标总连接数(到达后保持)")
 	flag.IntVar(&cfg.rate, "rate", 200, "客户端:每秒建连速率上限")
 	flag.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "客户端:TCP KeepAlive 间隔")
-	flag.DurationVar(&cfg.statsInt, "stats", 1*time.Second, "客户端:统计打印周期")
+	flag.DurationVar(&cfg.statsInt, "stats", 1*time.Second, "客户端:统计打印周期(最小 100ms)")
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		fmt.Fprintf(w, `tcp-stress — 家用宽带极限 TCP 长连接压测(单二进制)
@@ -105,6 +105,14 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: 读 -passfile %s: %v\n", passFile, err)
 			os.Exit(2)
+		}
+		// 宽权限(组/其他可读)告警:密码文件被同机其他账户读到即泄漏
+		// (0600/0400 视为收紧;stat 在读前,出错不拦使用)
+		if fi, ferr := f.Stat(); ferr == nil {
+			if fi.Mode().Perm()&0077 != 0 {
+				fmt.Fprintf(os.Stderr, "warning: -passfile %s 权限为 %o,组/其他用户可读,建议 chmod 600\n",
+					passFile, fi.Mode().Perm())
+			}
 		}
 		b, err := io.ReadAll(io.LimitReader(f, 129))
 		_ = f.Close()

@@ -110,7 +110,10 @@ func runServer(ports []string, pass string) error {
 	}
 	pn := make([]int, 0, len(ports))
 	for _, p := range ports {
-		if !isValidPort(p) {
+		// isValidPort 已拒尾部垃圾;再拒前导零:"08080" 会被 Atoi
+		// 解析成 8080 静默换绑另一端口(C 版 valid_port_str 已拒,
+		// 双实现须一致;实测旧版纯 Go 版 08080 实际监听 8080)
+		if !isValidPort(p) || (len(p) > 1 && p[0] == '0') {
 			return fmt.Errorf("invalid port: %s", p)
 		}
 		v, _ := strconv.Atoi(p)
