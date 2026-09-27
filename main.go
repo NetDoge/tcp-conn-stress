@@ -24,9 +24,15 @@ import (
 // 版本号:构建时注入(make VERSION=v1.0.3,CI 从 tag 取),默认 dev
 var version = "dev"
 
-// isValidPort 纯数字 1-65535(两种服务端实现与入口校验共用)
+// isValidPort 纯数字 1-65535、无前导零(两种服务端实现与入口校验共用)。
+// v1.2.1 补前导零拒绝:此前 "0080" 在本函数通过、要等服务端层才被拒,
+// 与 C 侧 valid_port_str(一直拒前导零)声称同语义实则不同;
+// 现在解析层即拒,入口/双服务端/TUI 三处一起收紧。
 func isValidPort(s string) bool {
 	if s == "" || len(s) > 5 {
+		return false
+	}
+	if s[0] == '0' && len(s) > 1 {
 		return false
 	}
 	n := 0
@@ -44,6 +50,9 @@ func isValidPort(s string) bool {
 // 且不得超出 64 个(与服务端监听上限一致,客户端同样套用)。
 // 返回 (list, err):list 为展开后的端口字符串;err 非空时 list 为空。
 // 空输入(全空白)返回空 list,nil —— 由调用方决定是否报错。
+// v1.2.1:范围分支 strconv.Itoa 回环校验拒前导零与 + 号("08888-08890"/
+// "+8888-8890"),与单端口分支(isValidPort)及客户端 parseTargets 同语义;
+// 展开后查重,重复/重叠端口直接报错,不必等到 bind 才失败。
 func parsePortSpec(spec string) ([]string, error) {
 	fields := strings.Fields(spec)
 	if len(fields) == 0 {
@@ -53,6 +62,15 @@ func parsePortSpec(spec string) ([]string, error) {
 		return nil, fmt.Errorf("端口段太多(空格分隔,最多 64 段): %d", len(fields))
 	}
 	var out []string
+	seen := make(map[string]bool)
+	addPort := func(ps string) error {
+		if seen[ps] {
+			return fmt.Errorf("重复端口: %s", ps)
+		}
+		seen[ps] = true
+		out = append(out, ps)
+		return nil
+	}
 	for _, f := range fields {
 		lo, hi := f, f
 		if i := strings.IndexByte(f, '-'); i >= 0 {
@@ -62,7 +80,8 @@ func parsePortSpec(spec string) ([]string, error) {
 			}
 			a, ea := strconv.Atoi(lo)
 			b, eb := strconv.Atoi(hi)
-			if ea != nil || eb != nil || a <= 0 || a > 65535 || b <= 0 || b > 65535 {
+			if ea != nil || eb != nil || a <= 0 || a > 65535 || b <= 0 || b > 65535 ||
+				strconv.Itoa(a) != lo || strconv.Itoa(b) != hi {
 				return nil, fmt.Errorf("invalid port: %s", f)
 			}
 			if a > b {
@@ -72,7 +91,9 @@ func parsePortSpec(spec string) ([]string, error) {
 				return nil, fmt.Errorf("端口总数超出上限 64")
 			}
 			for p := a; p <= b; p++ {
-				out = append(out, strconv.Itoa(p))
+				if err := addPort(strconv.Itoa(p)); err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}
@@ -83,7 +104,9 @@ func parsePortSpec(spec string) ([]string, error) {
 		if len(out)+1 > 64 {
 			return nil, fmt.Errorf("端口总数超出上限 64")
 		}
-		out = append(out, f)
+		if err := addPort(f); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -115,7 +138,7 @@ func main() {
 	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表(≤64,须为 tcp-stress 服务端),逗号分隔,格式 IP:Port")
 	flag.StringVar(&cfg.bind, "bind", "", "客户端:本地出口 IP(多 WAN/策略路由时指定)")
 	flag.Uint64Var(&cfg.target, "target", 10000, "客户端:目标总连接数(到达后保持)")
-	flag.IntVar(&cfg.rate, "rate", 200, "客户端:每秒建连速率上限")
+	flag.IntVar(&cfg.rate, "rate", 200, "客户端:每秒拨号尝试上限(含失败重试;v1.2.1 起一个令牌恰一次尝试)")
 	flag.DurationVar(&cfg.keepAlive, "keepalive", 30*time.Second, "客户端:TCP KeepAlive 间隔")
 	flag.DurationVar(&cfg.statsInt, "stats", 1*time.Second, "客户端:统计打印周期(最小 100ms)")
 	flag.Usage = func() {

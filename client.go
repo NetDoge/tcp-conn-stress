@@ -8,7 +8,7 @@
 // 特性:
 //   - 多端口轮询,每端口打到内核临时端口上限时切下一个
 //   - 自定义 net.Dialer:KeepAlive 30s + 小读写缓冲
-//   - 令牌桶限速,默认 200 conn/s,可调
+//   - 令牌桶限速,默认 200 conn/s,可调(一个令牌恰一次拨号尝试,v1.2.1)
 //   - 实时统计:尝试/成功/活跃/断开/失败 类别分布
 //   - v1.1.0 起每个连接必做 tcp-stress 身份握手,非 tcp-stress 服务端
 //     连续失败即中止 —— 无法直接用于对第三方的连接耗尽攻击
@@ -181,57 +181,54 @@ func isTimeoutErr(err error) bool {
 	return false
 }
 
-// dialer 负责拨号一次;返回的 conn 已建立。
-// portIdx: 失败切到下一个 target 时使用;成功则由调用方持有。
-// 失败时返回 err;成功时返回 conn、命中的 target 与下一个要试的 portIdx。
-// 返回值用于在多端口之间轮询。
-func dialOnce(ctx context.Context, targets []target, startIdx int, d *net.Dialer, pass string) (net.Conn, *target, int) {
-	tlen := len(targets)
-	for off := 0; off < tlen; off++ {
-		idx := (startIdx + off) % tlen
-		t := &targets[idx] // 指针:握手失败计数/忽略提示写回 target 本体
-		st.try.Add(1)
-		conn, err := d.DialContext(ctx, "tcp", t.addr)
-		if err != nil {
-			classifyErr(err)
-			if strings.Contains(err.Error(), "cannot assign requested address") ||
-				strings.Contains(err.Error(), "too many open files") {
-				// 端口/fd 耗尽,不要狂打;也跳过当前端口试下一个
-				time.Sleep(50 * time.Millisecond)
-			}
-			continue
+// dialOnce 拨号一次(单个 target);成功返回已建立的 conn 与下一个要试的
+// 索引,失败返回 nil conn 与下一个要试的索引(轮询切 target 的行为保留,
+// 由下一个令牌继续 —— 失败切换的延迟至多 1/rate 秒,毫秒级)。
+// v1.2.1:一个令牌恰对应一次拨号尝试。旧版失败会在同一令牌内连试全部
+// target,实际拨号速率可达 rate×N(实测 8 个 refused target、rate=100 时
+// try/s≈800),与「每秒拨号尝试上限」语义不符,也把多 target 列表的
+// 拒绝面放大 N 倍。
+func dialOnce(ctx context.Context, targets []target, idx int, d *net.Dialer, pass string) (net.Conn, *target, int) {
+	t := &targets[idx] // 指针:握手失败计数/忽略提示写回 target 本体
+	st.try.Add(1)
+	conn, err := d.DialContext(ctx, "tcp", t.addr)
+	if err != nil {
+		classifyErr(err)
+		if strings.Contains(err.Error(), "cannot assign requested address") ||
+			strings.Contains(err.Error(), "too many open files") {
+			// 端口/fd 耗尽,不要狂打;下一个令牌换下一个 target
+			time.Sleep(50 * time.Millisecond)
 		}
-		// v1.1.0 身份握手:每个连接必走。旧版仅在客户端配了 -pass 时
-		// 才探测鉴权,把客户端指向任意第三方服务(nginx/SSH 等)时
-		// 零拦截 —— 实测假静默服务器 50 连全持有,可当 slowloris 用。
-		if err := clientHandshake(conn, pass, t); err != nil {
-			_ = conn.Close()
-			var rej *hsReject
-			if errors.As(err, &rej) {
-				if rej.failAuth {
-					st.failAuth.Add(1)
-				} else {
-					st.failOther.Add(1)
-				}
-				if n := t.hsFail.Add(1); n >= hsConsecFail {
-					log.Fatal(rej.fatal)
-				}
-				continue
-			}
-			var ab *hsAbort
-			if errors.As(err, &ab) {
-				log.Fatal(ab.msg)
-			}
-			log.Fatal(err) // 不可达:握手错误只有 hsReject/hsAbort 两类
-		}
-		t.hsFail.Store(0)
-		st.ok.Add(1)
-		// active 的计入由调用方(worker)预留完成:拨号+鉴权中的连接
-		// 也占 target 名额,防多 worker 竞态过冲(实测 max_alive=target+1)
-		return conn, t, (idx + 1) % tlen
+		return nil, nil, (idx + 1) % len(targets)
 	}
-	// 全部失败:保持起点,下个 token 从同一位置再轮
-	return nil, nil, startIdx
+	// v1.1.0 身份握手:每个连接必走。旧版仅在客户端配了 -pass 时
+	// 才探测鉴权,把客户端指向任意第三方服务(nginx/SSH 等)时
+	// 零拦截 —— 实测假静默服务器 50 连全持有,可当 slowloris 用。
+	if err := clientHandshake(conn, pass, t); err != nil {
+		_ = conn.Close()
+		var rej *hsReject
+		if errors.As(err, &rej) {
+			if rej.failAuth {
+				st.failAuth.Add(1)
+			} else {
+				st.failOther.Add(1)
+			}
+			if n := t.hsFail.Add(1); n >= hsConsecFail {
+				log.Fatal(rej.fatal)
+			}
+			return nil, nil, (idx + 1) % len(targets)
+		}
+		var ab *hsAbort
+		if errors.As(err, &ab) {
+			log.Fatal(ab.msg)
+		}
+		log.Fatal(err) // 不可达:握手错误只有 hsReject/hsAbort 两类
+	}
+	t.hsFail.Store(0)
+	st.ok.Add(1)
+	// active 的计入由调用方(worker)预留完成:拨号+鉴权中的连接
+	// 也占 target 名额,防多 worker 竞态过冲(实测 max_alive=target+1)
+	return conn, t, (idx + 1) % len(targets)
 }
 
 // holdConn 维持连接:不收发数据,阻塞等待断开或 ctx 取消。
@@ -402,6 +399,11 @@ func runClient(cfg clientConfig) {
 		t := time.NewTicker(statsInt)
 		defer t.Stop()
 		var lastTry, lastOk uint64
+		// 持续全败提示(v1.2.1):try 在涨而 ok 不动 = 拨号阶段 100% 失败
+		// (地址写错/端口不通/防火墙丢包),低频提示替用户指路;ok 有增长
+		// 或 try 停止(已达 target 稳态)即复位。每轮失败期至多提示一次。
+		var failSince time.Time
+		failHinted := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -409,6 +411,19 @@ func runClient(cfg clientConfig) {
 			case <-t.C:
 				curTry := st.try.Load()
 				curOk := st.ok.Load()
+				if curTry > lastTry && curOk == lastOk {
+					if failSince.IsZero() {
+						failSince, failHinted = time.Now(), false
+					}
+					if !failHinted && time.Since(failSince) >= 30*time.Second {
+						failHinted = true
+						log.Printf("提示: 已连续 30s+ 拨号全部失败(rst=%d t/o=%d addr-full=%d fd-full=%d eof=%d auth=%d other=%d);检查 -servers 地址/端口与防火墙",
+							st.failRST.Load(), st.failTO.Load(), st.failAddr.Load(),
+							st.failFD.Load(), st.failEOF.Load(), st.failAuth.Load(), st.failOther.Load())
+					}
+				} else {
+					failSince, failHinted = time.Time{}, false
+				}
 				// 换算每秒速率:-stats 非 1s 时 +/s 才是真实值
 				dt := uint64(math.Round(float64(curTry-lastTry) / statsInt.Seconds()))
 				do := uint64(math.Round(float64(curOk-lastOk) / statsInt.Seconds()))

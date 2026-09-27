@@ -5,6 +5,8 @@ name: release
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
 # windows-386 / linux-386:32 位产物(纯 Go 服务端;32 位机不做 10w 级压测,C/epoll 大规模场景用 64 位产物)
+# v1.2.1:第五轮审计修复(端口范围前导零/加号拒绝、重复端口 fail-fast、
+#        -rate 一令牌一拨号语义、单测入库、全败提示)
 # v1.1.1:第四轮审计修复(-stats 下限/纯 Go 前导零端口/passfile 权限警告/README 示例对齐)
 # v1.1.0:防滥用改造(服务端身份握手 STRESS/AUTH? + 客户端拒连第三方 + targets≤64 + README 使用政策)
 # v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
@@ -137,6 +139,9 @@ jobs:
           fi
           echo 'GOFMT PASS'
 
+      - name: 单元测试
+        run: go test ./...
+
       - name: 参数校验
         run: |
           ./tcp-stress -c -servers 127.0.0.1:1 -rate 50001 2>&1 | grep -q 'rate too large'
@@ -148,6 +153,12 @@ jobs:
           ./tcp-stress -c -servers ':1' -rate 1 2>&1 | grep -q '空 host'
           ./tcp-stress -c -servers '[::]:1' -rate 1 2>&1 | grep -q '空 host'
           ./tcp-stress -c -servers 127.0.0.1:1 -stats 50ms 2>&1 | grep -q 'stats interval too small'
+          # v1.2.1 端口范围:前导零/加号/重复/重叠须在解析层即时拒绝
+          ./tcp-stress -s 08888-08890 2>&1 | grep -q 'invalid port'
+          ./tcp-stress -s +8888-8890 2>&1 | grep -q 'invalid port'
+          ./tcp-stress -s 18888 18888 2>&1 | grep -q '重复端口'
+          ./tcp-stress -s 18888-18892 18892 2>&1 | grep -q '重复端口'
+          ./tcp-stress -c -servers 127.0.0.1:08888-08890 -rate 1 2>&1 | grep -q 'bad port'
           echo pw > /tmp/pf644; chmod 644 /tmp/pf644
           ./tcp-stress -s -passfile /tmp/pf644 18888 > /tmp/pfw.log 2>&1 & PFW=$!
           sleep 0.6; kill -INT $PFW 2>/dev/null || true; sleep 0.3
@@ -157,6 +168,27 @@ jobs:
           ./tcp-stress -h    | grep -q '家用宽带'
           ./tcp-stress -h; [ $? -eq 0 ] || { echo 'FAIL: -h 应 exit 0'; exit 1; }
           ./tcp-stress --help | grep -q '客户端模式'
+
+      - name: 端口范围与限速语义回归(v1.2.1)
+        run: |
+          # 合法范围:服务端展开 4 端口监听
+          ./tcp-stress -s 18901-18904 > rng_s.log 2>&1 &
+          SRV=$!
+          sleep 0.6
+          n=$(grep -c 'listening on 0.0.0.0:1890' rng_s.log)
+          [ "$n" = "4" ] || { echo "FAIL: 范围未展开 4 端口($n)"; exit 1; }
+          kill -INT $SRV; sleep 0.5
+          # 客户端范围 target 展开
+          ./tcp-stress -c -servers "127.0.0.1:1-3" -rate 1 2>&1 | grep -q '  - 127.0.0.1:1' \
+            || { echo 'FAIL: 客户端范围 target 未展开'; exit 1; }
+          # 限速语义:一个令牌恰一次拨号尝试。8 个 refused target、rate=100
+          # 跑 ~4s:try 应在 100×4s 量级;旧版失败轮放大 N 倍可达 ~3200
+          timeout 4 ./tcp-stress -c -servers "127.0.0.1:49001-49008" \
+            -target 100 -rate 100 -stats 500ms > rng_c.log 2>&1 || true
+          try=$(grep -oE 'try=[0-9]+' rng_c.log | cut -d= -f2 | sort -n | tail -1)
+          [ "$try" -le 550 ] || { echo "FAIL: try=$try 超出 rate 语义上限(失败轮放大回归)"; exit 1; }
+          [ "$try" -ge 150 ] || { echo "FAIL: try=$try 过低,客户端未在拨号"; exit 1; }
+          echo 'RANGE & RATE PASS'
 
       # 135s:故意跨过旧版 120s 读超时 bug 的阈值。
       # 旧版会在此时限内把健康连接全杀一轮(try 远超 target),
