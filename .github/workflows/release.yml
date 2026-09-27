@@ -4,6 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
+# windows-386:32 位 Windows 产物(纯 Go 服务端,同 windows-amd64 路径)
 # v1.1.1:第四轮审计修复(-stats 下限/纯 Go 前导零端口/passfile 权限警告/README 示例对齐)
 # v1.1.0:防滥用改造(服务端身份握手 STRESS/AUTH? + 客户端拒连第三方 + targets≤64 + README 使用政策)
 # v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
@@ -39,6 +40,7 @@ jobs:
           - { name: darwin-amd64,  goos: darwin,  goarch: amd64 }
           - { name: darwin-arm64,  goos: darwin,  goarch: arm64 }
           - { name: windows-amd64, goos: windows, goarch: amd64 }
+          - { name: windows-386,   goos: windows, goarch: 386 }
     steps:
       - uses: actions/checkout@v7
 

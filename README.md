@@ -176,7 +176,8 @@ STATS 格式 / 断连回收 / 优雅退出 / KeepAlive 参数与 C 版对齐,
 | `tcp-conn-stress-linux-armv7l.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | armv7l 32 位 ARM(老树莓派 / 路由器 / OpenWrt) |
 | `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Intel Mac |
 | `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Apple Silicon Mac |
-| `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | Windows |
+| `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | Windows x64 |
+| `tcp-conn-stress-windows-386.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | 32 位 Windows(老机器/Win7) |
 | `SHA256SUMS.txt` | 校验和 | 全部 |
 
 想自己触发一次云编译,推个 tag 即可:
