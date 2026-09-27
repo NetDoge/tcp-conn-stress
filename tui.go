@@ -101,6 +101,7 @@ func confirm(r *bufio.Reader, cmd string) bool {
 func runTUI() {
 	fmt.Printf("tcp-stress %s (%s/%s) — TCP 长连接压测向导\n", version, runtime.GOOS, runtime.GOARCH)
 	fmt.Println("提示:向导中 Ctrl-C 直接退出;测试运行中 Ctrl-C 优雅退出并打印统计")
+	fmt.Println("本工具仅供测试自有/授权设备;客户端只与 tcp-stress 服务端建连")
 	r := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Println(`
@@ -133,7 +134,7 @@ func runTUI() {
 		case "2":
 			var servers, bind string
 			for {
-				s := ask(r, "服务器地址列表(IP:Port,逗号分隔)", "127.0.0.1:8888")
+				s := ask(r, "服务器地址列表(须为 tcp-stress 服务端,IP:Port 逗号分隔,最多 64 个)", "127.0.0.1:8888")
 				if _, err := parseTargets(s); err == nil {
 					servers = s
 					break

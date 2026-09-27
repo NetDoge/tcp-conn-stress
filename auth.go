@@ -1,20 +1,28 @@
-// auth.go - 服务端鉴权协议与握手实现(v1.0.6,-pass 启用)
+// auth.go - 服务端身份握手与鉴权协议(v1.1.0;-pass 鉴权自 v1.0.6)
 //
-// 服务端设了密码后,连接必须先通过单行文本握手才计入统计:
+// v1.1.0 起服务端在连接建立后必须先自报身份,客户端只与能完成握手的
+// tcp-stress 服务端维持连接 —— 指向任意第三方服务(nginx/SSH/IoT 等)
+// 的连接会在握手阶段被拒并中止。本工具因此无法被直接当作对第三方的
+// 连接耗尽攻击工具使用(见 README「使用政策」)。
 //
-//	server → client:  "AUTH?\n"       连接建立即发(仅服务端设了密码时)
-//	client → server:  "AUTH <密码>\n"
-//	server → client:  "AUTH OK\n"     通过,转正常计数
-//	                   "AUTH ERR\n"    拒绝,断开,不计任何数
+// 协议(服务端 → 客户端,连接建立即发一行):
+//   "AUTH?\n"   服务端设了 -pass,要求密码
+//   "STRESS\n"  服务端开放模式(v1.1.0 新增)
+// 客户端按身份行走对应分支:
+//   AUTH?  → 客户端发 "AUTH <密码>\n",服务端回 "AUTH OK\n" / "AUTH ERR\n"
+//   STRESS → 客户端配了 -pass 属该 target 配置错配:提示一次后忽略,
+//            连接照常保持(混合"开放+鉴权"列表是合法用法,不中止)
+// 任何其他内容/超时/EOF = 非 tcp-stress 服务端(或 v1.0.x 及更早的开放
+// 模式服务端),按 target 连续失败计数,达到上限即整个客户端中止
+// (防把滥用失败当正常丢包无限重试;按 target 计数则防混合列表里
+// 一台真服务端的成功不断清零计数、掩护假 target 逃过中止)。
 //
-// 双端都未配 -pass 时协议完全不出现,行为与旧版逐字节一致。
-// 明文单行协议,防的是公网误用/白嫖占 fd,不是密码学对抗 —— 公网部署
+// 明文单行协议,防的是误用与第三方滥用,不是密码学对抗 —— 公网部署
 // 仍建议安全组限源(见 README 安全注意)。
 
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -26,12 +34,29 @@ const (
 	authBanner   = "AUTH?\n"    // 服务端 → 客户端:要求鉴权
 	authOK       = "AUTH OK\n"  // 通过
 	authERR      = "AUTH ERR\n" // 拒绝
+	srvBanner    = "STRESS\n"   // 服务端 → 客户端:开放模式身份行(v1.1.0)
 	authLineMax  = 160          // 握手单行上限(含 \n),防恶意超长
 	authClientTO = 5 * time.Second
 	authServerTO = 10 * time.Second
 )
 
-var errAuthFail = errors.New("auth failed")
+// hsConsecFail:同一 target 连续握手失败达到该次数后,客户端整体中止
+const hsConsecFail = 10
+
+// hsAbort 立即中止类错误(两端配置错配,重试无意义)
+type hsAbort struct{ msg string }
+
+func (e *hsAbort) Error() string { return e.msg }
+
+// hsReject 可重试失败(对端非 tcp-stress / 密码不对);由 dialOnce 按
+// target 计连续次数,达到 hsConsecFail 用 fatal 文案中止。
+// failAuth:归入 failAuth 统计(鉴权失败);否则归 failOther(身份不符)
+type hsReject struct {
+	fatal    string
+	failAuth bool
+}
+
+func (e *hsReject) Error() string { return e.fatal }
 
 // validatePass 密码约束:非空时 1-128 字节,不含空白/控制字符
 // (密码走单行文本协议,空白会破坏行格式)
@@ -71,67 +96,58 @@ func readAuthLine(c net.Conn) (string, error) {
 
 // ---------------- 客户端侧 ----------------
 
-// clientAuth 建连后的握手;仅客户端配置了 -pass 时调用。
-// t.noAuth:该 target 已确认服务器不要求鉴权(无 -pass 服务端/旧版二进制),
-// 后续连接跳过探测,不再空等 5s banner 超时。
-// 状态记在 target 上而非全局(旧版全局标志在混合列表下互相污染:
-// 无密码服务器把状态置位后,带密码服务器的握手也被跳过,正确密码被误杀)。
-func clientAuth(conn net.Conn, pass string, t *target) error {
-	if t.noAuth.Load() {
-		return nil
-	}
+// clientHandshake 建连后的身份握手;每个连接都走(v1.1.0 起不再有
+// "本端未配 -pass 就跳过握手"的路径 —— 那条路正是把客户端指向任意
+// 第三方服务时零拦截的根因)。成功返回 nil,连接转 hold。
+func clientHandshake(conn net.Conn, pass string, t *target) error {
 	_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
 	line, err := readAuthLine(conn)
-	if err != nil || line != authBanner {
-		// 读超时/EOF/非 banner 内容:该服务器不要求鉴权(或为旧版二进制)
-		if t.noAuth.CompareAndSwap(false, true) {
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		// 超时/EOF/超长行:对端不是 tcp-stress 服务端
+		// (或 v1.0.x 及更早的开放模式服务端,须升级)
+		return &hsReject{fatal: notStressFatalMsg(t.addr)}
+	}
+	switch line {
+	case authBanner:
+		if pass == "" {
+			return &hsAbort{msg: fmt.Sprintf(
+				"服务器 %s 要求鉴权但握手未完成(本端未配 -pass / 两端配置不一致 / 网络延迟过高),已中止", t.addr)}
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(authClientTO))
+		_, werr := conn.Write([]byte(authPrefix + pass + "\n"))
+		_ = conn.SetWriteDeadline(time.Time{})
+		if werr != nil {
+			return &hsReject{fatal: authFatalMsg(t.addr), failAuth: true}
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
+		resp, rerr := readAuthLine(conn)
+		_ = conn.SetReadDeadline(time.Time{}) // 必须清掉,否则 hold 的读会超时
+		if rerr != nil || resp != authOK {
+			return &hsReject{fatal: authFatalMsg(t.addr), failAuth: true}
+		}
+		return nil
+	case srvBanner:
+		if pass != "" && t.noAuthLogged.CompareAndSwap(false, true) {
 			log.Printf("server %s 未要求鉴权,-pass 已忽略", t.addr)
 		}
-		_ = conn.SetReadDeadline(time.Time{})
 		return nil
+	default:
+		return &hsReject{fatal: notStressFatalMsg(t.addr)}
 	}
-	if pass == "" {
-		_ = conn.SetReadDeadline(time.Time{})
-		return errAuthFail
-	}
-	_ = conn.SetWriteDeadline(time.Now().Add(authClientTO))
-	_, werr := conn.Write([]byte(authPrefix + pass + "\n"))
-	_ = conn.SetWriteDeadline(time.Time{})
-	if werr != nil {
-		return errAuthFail
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
-	resp, rerr := readAuthLine(conn)
-	_ = conn.SetReadDeadline(time.Time{}) // 必须清掉,否则 hold 的读会超时
-	if rerr != nil || resp != authOK {
-		return errAuthFail
-	}
-	return nil
 }
 
-// lateAuthRecover 迟到 banner 的现场补握手(holdConn 调用):
-// clientAuth 因 5s 内未收到 banner 把 target 误判为 noAuth 后,真 banner
-// 到达时在这里补完握手。成功则撤销 noAuth(该 target 后续连接恢复正常
-// 握手路径),连接继续作为已建连保持;失败返回 false(密码不匹配等)。
-// 旧版此处直接 Fatal:驱逐风暴/高延迟下的瞬时 banner 超时被固化成
-// 永久误判,带正确密码的客户端整批自杀(实测 mock 延迟 7s → rc=1)。
-func lateAuthRecover(conn net.Conn, pass string, t *target) bool {
-	_ = conn.SetWriteDeadline(time.Now().Add(authClientTO))
-	_, werr := conn.Write([]byte(authPrefix + pass + "\n"))
-	_ = conn.SetWriteDeadline(time.Time{})
-	if werr != nil {
-		return false
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(authClientTO))
-	resp, rerr := readAuthLine(conn)
-	_ = conn.SetReadDeadline(time.Time{}) // 清掉,继续无限期等断开
-	if rerr != nil || resp != authOK {
-		return false
-	}
-	if t.noAuth.CompareAndSwap(true, false) {
-		log.Printf("server %s banner 迟到,已补握手并撤销 noAuth 误判(网络延迟/服务端过载所致)", t.addr)
-	}
-	return true
+// authFatalMsg 鉴权类连续失败的中止文案
+func authFatalMsg(addr string) string {
+	return fmt.Sprintf("服务器 %s 鉴权连续失败 %d 次(密码不正确或两端配置不一致),已中止;检查两端 -pass",
+		addr, hsConsecFail)
+}
+
+// notStressFatalMsg 非 tcp-stress 对端连续失败的中止文案(防滥用核心)
+func notStressFatalMsg(addr string) string {
+	return fmt.Sprintf("服务器 %s 连续 %d 次未通过 tcp-stress 身份握手,已中止;"+
+		"本工具仅限测试自有/授权的 tcp-stress 服务端"+
+		"(对端若为 v1.0.x 及更早版本的开放模式服务端,请先升级两端)", addr, hsConsecFail)
 }
 
 // ---------------- 服务端侧(Go 实现;C 实现见 csrc/server.c) ----------------

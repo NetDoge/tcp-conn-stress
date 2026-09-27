@@ -15,6 +15,8 @@
  *
  * 鉴权(v1.0.6,-pass 启用;协议见 auth.go,与纯 Go 服务端一致):
  *   accept → 立即发 "AUTH?\n",连接进入"鉴权中",epoll 额外盯 EPOLLIN;
+ *   开放模式(无 -pass)accept 即发 "STRESS\n" 身份行(v1.1.0)——
+ *   客户端只与能完成身份握手的 tcp-stress 服务端保持连接,防第三方滥用
  *   收到 "AUTH <密码>\n" 匹配 → 回 "AUTH OK\n",转已建连(开始计数),
  *   只盯 RDHUP/ERR/HUP;不匹配/超时(10s)/断开 → 回 "AUTH ERR\n" 关闭,
  *   计 auth_fail,不进任何连接统计。密码错误连接不占 alive/fd 长期。
@@ -107,6 +109,8 @@ __attribute__((unused)) static void tcp_server_set_pass(const char *p) {
 static const char AUTH_BANNER_S[] = "AUTH?\n";
 static const char AUTH_OK_S[]     = "AUTH OK\n";
 static const char AUTH_ERR_S[]    = "AUTH ERR\n";
+/* v1.1.0 开放模式身份行:客户端据此区分 tcp-stress 服务端与第三方服务 */
+static const char STRESS_BANNER_S[] = "STRESS\n";
 
 /* ---- v1.0.8 本批待关队列(驱逐受害者延迟 close)----
  * epoll_wait 返回的 events[] 是批快照:受害者的 RDHUP 事件可能已在其中。
@@ -371,6 +375,9 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     memset(pause_until, 0, sizeof(pause_until));
     if (g_pass) {
         fprintf(stderr, "auth: enabled (password set)\n");
+    } else {
+        fprintf(stderr, "warning: 未设 -pass,任何能路由到本端口的客户端"
+                        "都能占用连接槽位;公网部署建议加 -pass 并限源\n");
     }
     fprintf(stderr, "server running, ctrl-c to stop.\n");
     while (!g_stop) {
@@ -567,6 +574,13 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
                         continue;
                     }
                     continue; /* 等鉴权行,不计任何连接数 */
+                }
+                /* v1.1.0 开放模式身份行:写失败(对端已断)直接关闭,
+                 * 不计任何数;SIGPIPE 已全局忽略,进程不受影响 */
+                if (write(cfd, STRESS_BANNER_S, sizeof(STRESS_BANNER_S) - 1)
+                        != (ssize_t)(sizeof(STRESS_BANNER_S) - 1)) {
+                    close(cfd);
+                    continue;
                 }
                 /* 连接 fd 挂 epoll:只盯断开/错误,不监听 EPOLLIN(不收数据) */
                 memset(&ev, 0, sizeof(ev));

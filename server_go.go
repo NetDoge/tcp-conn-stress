@@ -5,6 +5,7 @@
 // v1.0.5 起所有平台都能跑 -s:Linux+cgo 走 C/epoll 实现(server_linux.go),
 // 其余构建走本文件。行为与 C 版对齐:
 //   - 多端口监听(AF_INET),统一计数 alive / total_acc / total_close / 分端口
+//   - v1.1.0:accept 即发身份行("AUTH?\n" 带密码 / "STRESS\n" 开放),与 C 版对齐
 //   - 小缓冲(2K)+ TCP_NODELAY + KeepAlive(60s idle / 10s interval / 3 次,平台支持范围内)
 //   - STATS 每秒输出,格式与 C 版逐字一致
 //   - SIGINT/SIGTERM/SIGHUP 优雅退出:先关 listener,再逐个 close 连接(对端收 FIN)
@@ -173,6 +174,16 @@ func runServer(ports []string, pass string) error {
 					// "鉴权中"的连接 —— 旧版它们卡在 10s 读 deadline 上,
 					// 退出恒烧满 5s 兜底(实测 SIGINT 后固定 5.0s 才 bye)
 					s.conns.Store(c, idx)
+					if pass == "" {
+						// v1.1.0 开放模式身份行:客户端据此区分"tcp-stress
+						// 服务端"与"任意第三方服务",第三方滥用在建连
+						// 阶段即被客户端拒掉;写失败(对端已断)按未建连处理
+						if _, werr := c.Write([]byte(srvBanner)); werr != nil {
+							s.conns.Delete(c)
+							_ = c.Close()
+							return
+						}
+					}
 					if pass != "" {
 						// 鉴权中队列上限 + 驱逐(v1.0.9,对齐 C 版语义):
 						// 连上不回密码的停滞连接可无限占槽耗 fd/内存;直接拒绝
@@ -241,6 +252,8 @@ func runServer(ports []string, pass string) error {
 
 	if pass != "" {
 		fmt.Fprintln(os.Stderr, "auth: enabled (password set)")
+	} else {
+		fmt.Fprintln(os.Stderr, "warning: 未设 -pass,任何能路由到本端口的客户端都能占用连接槽位;公网部署建议加 -pass 并限源")
 	}
 	fmt.Fprintln(os.Stderr, "server running, ctrl-c to stop.")
 	<-ctx.Done()

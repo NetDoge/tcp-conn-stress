@@ -62,7 +62,7 @@ func main() {
 	flag.StringVar(&pass, "pass", "", "鉴权密码:服务端启用后,客户端须提供相同密码(1-128 字节,无空白)。注意:密码会出现在 ps/进程列表里,敏感场景用 -passfile")
 	flag.StringVar(&passFile, "passfile", "", "从文件读鉴权密码(取首行;文件建议 chmod 600)。不落进程命令行,ps 不可见")
 	flag.BoolVar(&clientMode, "c", false, "客户端模式")
-	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表,逗号分隔,格式 IP:Port")
+	flag.StringVar(&cfg.servers, "servers", "127.0.0.1:8888", "客户端:目标地址列表(≤64,须为 tcp-stress 服务端),逗号分隔,格式 IP:Port")
 	flag.StringVar(&cfg.bind, "bind", "", "客户端:本地出口 IP(多 WAN/策略路由时指定)")
 	flag.Uint64Var(&cfg.target, "target", 10000, "客户端:目标总连接数(到达后保持)")
 	flag.IntVar(&cfg.rate, "rate", 200, "客户端:每秒建连速率上限")
@@ -71,6 +71,8 @@ func main() {
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		fmt.Fprintf(w, `tcp-stress — 家用宽带极限 TCP 长连接压测(单二进制)
+
+仅供测试自有/授权的设备;客户端只与 tcp-stress 服务端建连(身份握手,详见 README 使用政策)
 
 用法:
   tcp-stress -s <port1> [port2] ...          服务器模式(Linux 为 C/epoll,其余为纯 Go)

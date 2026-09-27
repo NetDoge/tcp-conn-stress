@@ -4,6 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
+# v1.1.0:防滥用改造(服务端身份握手 STRESS/AUTH? + 客户端拒连第三方 + targets≤64 + README 使用政策)
 # v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
 # v1.0.8:复审修复(驱逐陈旧事件下溢/驱逐风暴 CPU/banner 迟到自愈/passfile 限读/Go 服务端退出)
 #
@@ -19,7 +20,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.9'
+        default: 'v1.1.0'
 
 permissions:
   contents: read
@@ -293,6 +294,66 @@ jobs:
           grep -q 'pass 已忽略' ca4.log || { echo 'FAIL: 未提示忽略'; exit 1; }
           grep -q 'final: try=20 ok=20' ca4.log || { echo 'FAIL: 忽略密码后未正常连接'; exit 1; }
           echo 'AUTH MATRIX PASS'
+
+      - name: 防滥用回归(v1.1.0)
+        run: |
+          # 1) 假静默服务器:客户端不得持有任何连接,按 target 连续 10 次
+          #    握手失败后中止 rc=1(旧版静默全收,可当 slowloris 用)
+          python3 - <<'PYEOF' &
+          import socket, threading, time
+          def silent():
+              s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(('127.0.0.1', 18890)); s.listen(500)
+              conns = []
+              while True:
+                  c, _ = s.accept(); conns.append(c)
+          threading.Thread(target=silent, daemon=True).start()
+          time.sleep(60)
+          PYEOF
+          FK=$!
+          sleep 0.5
+          rc=0
+          timeout 30 ./tcp-stress -c -servers 127.0.0.1:18890 -target 50 -rate 10 > ab1.log 2>&1 || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: 假静默服务器应 rc=1,实际 $rc"; cat ab1.log; exit 1; }
+          grep -q '未通过 tcp-stress 身份握手' ab1.log || { echo 'FAIL: 无身份握手中止文案'; cat ab1.log; exit 1; }
+          # log.Fatal 中止不打 final 行,断言改为:全日志(STAT+final)无任何成功
+          if grep -qE 'ok=[1-9]' ab1.log; then
+            echo 'FAIL: 假服务器上有连接成功被持有'; grep -E 'ok=[1-9]' ab1.log | head -3; exit 1
+          fi
+          kill $FK 2>/dev/null || true
+
+          # 2) 混合列表防绕过:真服务端+假静默 target 同列表。按 target 计数
+          #    须中止;全局计数设计会被真服务端的成功不断清零、永不中止
+          ./tcp-stress -s 18888 > ab2s.log 2>&1 &
+          SRV=$!
+          python3 - <<'PYEOF' &
+          import socket, threading, time
+          def silent():
+              s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(('127.0.0.1', 18891)); s.listen(500)
+              conns = []
+              while True:
+                  c, _ = s.accept(); conns.append(c)
+          threading.Thread(target=silent, daemon=True).start()
+          time.sleep(60)
+          PYEOF
+          FK=$!
+          sleep 0.5
+          rc=0
+          timeout 30 ./tcp-stress -c -servers "127.0.0.1:18888,127.0.0.1:18891"             -target 20 -rate 10 > ab2.log 2>&1 || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: 混合列表应中止 rc=1,实际 $rc(全局计数回归)"; cat ab2.log; exit 1; }
+          grep -q '18891 连续 10 次未通过' ab2.log || { echo 'FAIL: 未点名假 target'; cat ab2.log; exit 1; }
+          kill -INT $SRV; sleep 0.5
+          kill $FK 2>/dev/null || true
+
+          # 3) 65 个 target 拒绝(封端口扫描面);64 个放行
+          T65=$(python3 -c "print(','.join('10.0.0.%d:8888'%(i+1) for i in range(65)))")
+          ./tcp-stress -c -servers "$T65" -rate 1 2>&1 | grep -q 'too many targets' \
+            || { echo 'FAIL: 65 target 未拒绝'; exit 1; }
+          T64=$(python3 -c "print(','.join('10.0.0.%d:8888'%(i+1) for i in range(64)))")
+          ./tcp-stress -c -servers "$T64" -rate 1 2>&1 | grep -q 'targets:' \
+            || { echo 'FAIL: 64 target 应放行'; exit 1; }
+          echo 'ANTI-ABUSE PASS'
 
       - name: 审计回归测试(v1.0.7 修复项)
         run: |
