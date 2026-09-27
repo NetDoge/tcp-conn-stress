@@ -594,11 +594,12 @@ __attribute__((unused)) static int tcp_server_main(int argc, char **argv) {
     DIR *d = opendir("/proc/self/fd");
     if (d) {
         struct dirent *de;
+        int dfd = dirfd(d); /* 退出遍历不可 close 正在 readdir 的目录 fd(理论 UB); */
         while ((de = readdir(d)) != NULL) {
             if (de->d_name[0] == '.') continue;
             int fd = atoi(de->d_name);
             if (fd <= 2) continue;          /* stdin/stdout/stderr */
-            if (fd == ep) continue;
+            if (fd == ep || fd == dfd) continue;
             struct stat st;
             if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
                 close(fd);

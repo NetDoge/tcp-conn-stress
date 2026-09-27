@@ -33,6 +33,11 @@ const (
 	kaIdle     = 60 * time.Second
 	kaInterval = 10 * time.Second
 	kaCount    = 3
+
+	// authPendingMax: 鉴权中连接上限,与 C 侧 AUTH_MAX 对齐。
+	// 满时驱逐一条鉴权中连接给新连接让位(纯 Go 版 v1.0.8 前无上限:
+	// 实测 8000 停滞连接全收,ΔRSS 43.5MB,零驱逐)。
+	authPendingMax = 4096
 )
 
 type goServer struct {
@@ -43,6 +48,18 @@ type goServer struct {
 	perPort    []atomic.Int64
 	ports      []int
 	conns      sync.Map // net.Conn -> int(portIdx)
+
+	mu           sync.Mutex            // 保护 pending / lastEvictLog
+	pending      map[net.Conn]struct{} // 鉴权中连接:上限 authPendingMax,满时驱逐(与 C 版对齐)
+	lastEvictLog time.Time
+}
+
+// evictLog 驱逐日志 10s 限频(对齐 C 版 g_last_evict_log;调用方须持有 mu)
+func (s *goServer) evictLog() {
+	if time.Since(s.lastEvictLog) >= 10*time.Second {
+		s.lastEvictLog = time.Now()
+		fmt.Fprintf(os.Stderr, "auth: pending full (%d), evicted one stalled connection\n", authPendingMax)
+	}
 }
 
 func (s *goServer) tune(c *net.TCPConn) {
@@ -104,7 +121,11 @@ func runServer(ports []string, pass string) error {
 		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer stop()
 
-	s := &goServer{ports: pn, perPort: make([]atomic.Int64, len(pn))}
+	s := &goServer{
+		ports:   pn,
+		perPort: make([]atomic.Int64, len(pn)),
+		pending: make(map[net.Conn]struct{}),
+	}
 
 	var wg sync.WaitGroup
 	var listeners []net.Listener
@@ -153,7 +174,26 @@ func runServer(ports []string, pass string) error {
 					// 退出恒烧满 5s 兜底(实测 SIGINT 后固定 5.0s 才 bye)
 					s.conns.Store(c, idx)
 					if pass != "" {
-						if !serverAuth(c, pass) {
+						// 鉴权中队列上限 + 驱逐(v1.0.9,对齐 C 版语义):
+						// 连上不回密码的停滞连接可无限占槽耗 fd/内存;直接拒绝
+						// 新连接会让停滞洪水永久锁死正确密码的合法客户端,
+						// 驱逐一条让位。入队与驱逐同一临界区,上限不变式严格成立。
+						s.mu.Lock()
+						if len(s.pending) >= authPendingMax {
+							for v := range s.pending {
+								delete(s.pending, v)
+								s.evictLog()
+								_ = v.Close() // 受害者 serverAuth 读失败自行走失败清理
+								break
+							}
+						}
+						s.pending[c] = struct{}{}
+						s.mu.Unlock()
+						ok := serverAuth(c, pass)
+						s.mu.Lock()
+						delete(s.pending, c)
+						s.mu.Unlock()
+						if !ok {
 							if ctx.Err() == nil {
 								s.authFail.Add(1) // 退出期关闭不算鉴权失败
 							}

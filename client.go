@@ -84,6 +84,12 @@ func parseTargets(s string) ([]target, error) {
 		if err != nil {
 			return nil, fmt.Errorf("bad target %q: %v", p, err)
 		}
+		// 空 host(":8888" / "[::]:8888")会被 Dial 静默解成本机,
+		// 笔误时测错对象而无任何提示(实测旧版 try=3 ok=3 连上本机);
+		// IPv4 需显式写 IP 或 0.0.0.0,IPv6 写 [::1] 等具体地址
+		if host == "" || host == "::" {
+			return nil, fmt.Errorf("bad target %q: 空 host,请写具体地址(如 127.0.0.1:8888 或 [::1]:8888)", p)
+		}
 		// 回环校验拒绝尾部垃圾与前导零/正负号("8888x"/"0080"/"+80"),
 		// 与服务端 isValidPort 同等严格(旧版 fmt.Sscanf 不查尾部,静默拨错端口)
 		pn, err := strconv.Atoi(port)

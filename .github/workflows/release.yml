@@ -4,6 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
+# v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
 # v1.0.8:复审修复(驱逐陈旧事件下溢/驱逐风暴 CPU/banner 迟到自愈/passfile 限读/Go 服务端退出)
 #
 # 单一二进制 tcp-stress(-s 服务端 / -c 客户端),全平台全功能:
@@ -18,7 +19,7 @@ on:
       version:
         description: '版本号(tag),如 v1.0.1'
         required: true
-        default: 'v1.0.8'
+        default: 'v1.0.9'
 
 permissions:
   contents: read
@@ -135,6 +136,8 @@ jobs:
           ./tcp-stress -s 2>&1 | grep -q '至少一个端口'
           ./tcp-stress 8888 -c 2>&1 | grep -q '未指定模式'
           ./tcp-stress -c -servers 127.0.0.1:1 -target 9223372036854775808 2>&1 | grep -q 'target too large'
+          ./tcp-stress -c -servers ':1' -rate 1 2>&1 | grep -q '空 host'
+          ./tcp-stress -c -servers '[::]:1' -rate 1 2>&1 | grep -q '空 host'
           ./tcp-stress -v    | grep -q '^tcp-stress ci-smoke (linux/amd64)'
           ./tcp-stress --version | grep -q 'ci-smoke'
           ./tcp-stress -h    | grep -q '家用宽带'
@@ -213,6 +216,40 @@ jobs:
           kill -INT $SRV
           grep -q 'bye. final alive' sg.log || { echo "FAIL: Go 服务端退出异常"; exit 1; }
           echo 'GO SERVER PASS'
+
+      - name: 纯 Go 服务端鉴权上限回归(v1.0.9)
+        run: |
+          # 纯 Go 版鉴权中队列须有上限(4096)+满时驱逐:
+          # 旧版无上限,4200 停滞连接全收(实测 ΔRSS 43.5MB@8000);
+          # 修复后驱逐生效,停滞洪水下合法客户端仍 ok=10/10
+          ulimit -S -n 65535 2>/dev/null || true
+          CGO_ENABLED=0 go build -o tcp-stress-go .
+          ./tcp-stress-go -s -pass s3cret 18888 > ags.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          python3 - <<'PYEOF'
+          import socket, subprocess, time, re, signal
+          socks = []
+          for i in range(4200):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 18888), timeout=2)
+                  s.settimeout(2); s.recv(64); socks.append(s)
+              except Exception:
+                  break
+          assert len(socks) >= 4100, f'stalled too few: {len(socks)}'
+          cli = subprocess.Popen(['./tcp-stress', '-c', '-servers', '127.0.0.1:18888',
+                                  '-pass', 's3cret', '-target', '10', '-rate', '10'],
+                                 stdout=open('agc.log', 'w'), stderr=subprocess.STDOUT)
+          time.sleep(6)
+          cli.send_signal(signal.SIGINT)
+          cli.wait(timeout=15)
+          out = open('agc.log', errors='replace').read()
+          assert re.search(r'final: try=10 ok=10', out), out[-400:]
+          for s in socks: s.close()
+          print('GO-AUTH-CAP PASS')
+          PYEOF
+          grep -q 'evicted one stalled' ags.log || { echo 'FAIL: 无驱逐日志(上限未生效)'; exit 1; }
+          kill -INT $SRV; sleep 0.5
 
       - name: 鉴权矩阵测试
         run: |
