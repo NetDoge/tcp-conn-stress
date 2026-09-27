@@ -4,7 +4,7 @@ name: release
 #   1) 推 tag 触发:  git push origin v1.0.6
 #   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
 #
-# windows-386:32 位 Windows 产物(纯 Go 服务端,同 windows-amd64 路径)
+# windows-386 / linux-386:32 位产物(纯 Go 服务端;32 位机不做 10w 级压测,C/epoll 大规模场景用 64 位产物)
 # v1.1.1:第四轮审计修复(-stats 下限/纯 Go 前导零端口/passfile 权限警告/README 示例对齐)
 # v1.1.0:防滥用改造(服务端身份握手 STRESS/AUTH? + 客户端拒连第三方 + targets≤64 + README 使用政策)
 # v1.0.9:第三轮审计修复(纯 Go 服务端鉴权上限+驱逐/空 host 拒绝/dirfd UB/README 语义)
@@ -37,6 +37,7 @@ jobs:
           - { name: linux-amd64,   goos: linux,   goarch: amd64 }
           - { name: linux-arm64,   goos: linux,   goarch: arm64, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu }
           - { name: linux-armv7l,  goos: linux,   goarch: arm, goarm: '7' }
+          - { name: linux-386,     goos: linux,   goarch: 386 }
           - { name: darwin-amd64,  goos: darwin,  goarch: amd64 }
           - { name: darwin-arm64,  goos: darwin,  goarch: arm64 }
           - { name: windows-amd64, goos: windows, goarch: amd64 }
@@ -62,7 +63,7 @@ jobs:
           # 版本号:tag 触发取 tag 名,手动触发取输入
           V='${{ github.event.inputs.version || github.ref_name }}'
           echo "building version: ${V}"
-          if [ '${{ matrix.goos }}' = 'linux' ] && [ '${{ matrix.goarch }}' != 'arm' ]; then
+          if [ '${{ matrix.goos }}' = 'linux' ] && [ '${{ matrix.goarch }}' != 'arm' ] && [ '${{ matrix.goarch }}' != '386' ]; then
             # cgo 静态构建:C 服务端经 server_linux.go 编入,交叉时 CC 指向交叉工具链
             CGO_ENABLED=1 CC='${{ matrix.cc || 'gcc' }}' GOARCH='${{ matrix.goarch }}' \
               go build -trimpath -tags 'osusergo netgo' \
@@ -83,6 +84,10 @@ jobs:
             if [ '${{ matrix.goarch }}' = 'amd64' ]; then ./tcp-stress -v; fi
             if [ '${{ matrix.goarch }}' = 'arm' ]; then
               readelf -h tcp-stress | grep -q 'Machine:.*ARM' || { echo 'FAIL: not ARM'; exit 1; }
+              readelf -h tcp-stress | grep -q 'Class:.*ELF32' || { echo 'FAIL: not ELF32'; exit 1; }
+            fi
+            if [ '${{ matrix.goarch }}' = '386' ]; then
+              readelf -h tcp-stress | grep -q 'Machine:.*Intel 80386' || { echo 'FAIL: not i386'; exit 1; }
               readelf -h tcp-stress | grep -q 'Class:.*ELF32' || { echo 'FAIL: not ELF32'; exit 1; }
             fi
           else

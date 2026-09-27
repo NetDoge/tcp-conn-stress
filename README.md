@@ -174,6 +174,7 @@ STATS 格式 / 断连回收 / 优雅退出 / KeepAlive 参数与 C 版对齐,
 | `tcp-conn-stress-linux-amd64.tar.gz` | `tcp-stress`(全功能) | x86_64 Linux |
 | `tcp-conn-stress-linux-arm64.tar.gz` | `tcp-stress`(全功能) | ARM64 Linux(树莓派等) |
 | `tcp-conn-stress-linux-armv7l.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | armv7l 32 位 ARM(老树莓派 / 路由器 / OpenWrt) |
+| `tcp-conn-stress-linux-386.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | 32 位 x86 Linux(老机器 / 旧 VM) |
 | `tcp-conn-stress-darwin-amd64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Intel Mac |
 | `tcp-conn-stress-darwin-arm64.tar.gz` | `tcp-stress`(全功能,纯 Go 服务端) | Apple Silicon Mac |
 | `tcp-conn-stress-windows-amd64.zip` | `tcp-stress.exe`(全功能,纯 Go 服务端) | Windows x64 |
